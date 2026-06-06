@@ -1,0 +1,4 @@
+# Rust
+/target/
+**/*.rs.bk
+# Binary crate: Cargo.lock IS committed for reproducible builds (do not ignore it).
