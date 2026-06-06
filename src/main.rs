@@ -1,3 +1,3 @@
 fn main() {
-    println!("synth-ui — architecture phase, no implementation yet.");
+    synth_core::synth_hello_world();
 }
