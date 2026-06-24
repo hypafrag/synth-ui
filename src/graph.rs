@@ -8,7 +8,8 @@
 use std::collections::HashMap;
 
 use synth_core::model::{Endpoint, Node, Patch, Wire};
-use synth_core::module::{Icon, Registry, SignalKind, icons};
+use synth_core::modules::icons;
+use synth_core::module::{Icon, Registry, SignalKind};
 
 // Node geometry constants, in millimeters (the world unit; see 12-ui-rendering.md). Shared by
 // hit-testing, rendering, and autolayout so they agree. Tweak any of these to resize uniformly.
