@@ -10,13 +10,24 @@ use std::collections::HashMap;
 use synth_core::model::{Endpoint, Node, Patch, Wire};
 use synth_core::module::{Registry, SignalKind};
 
-// Node geometry constants, in world units. Shared by hit-testing and rendering so they agree.
-const NODE_W: f32 = 150.0;
-const HEADER_H: f32 = 26.0;
-const PORT_ROW: f32 = 22.0;
-const PAD_BOTTOM: f32 = 10.0;
-pub const PORT_R: f32 = 6.0;
-const PORT_HIT_R: f32 = 10.0;
+// Node geometry constants, in millimeters (the world unit; see 12-ui-rendering.md). Shared by
+// hit-testing, rendering, and autolayout so they agree. Tweak any of these to resize uniformly.
+const NODE_W_MM: f32 = 28.0;
+pub const HEADER_H_MM: f32 = 6.0;
+const PORT_ROW_MM: f32 = 5.0;
+/// Padding below the last port row (bottom inner margin).
+const PAD_MM: f32 = 2.5;
+pub const PORT_R_MM: f32 = 1.4;
+const PORT_HIT_R_MM: f32 = 2.6;
+
+/// Node box size `[w, h]` in mm for `rows` port rows. The single source of truth for node size,
+/// used by both `node_size` (descriptor-driven) and `geoms`.
+fn size_from_rows(rows: usize) -> [f32; 2] {
+    [
+        NODE_W_MM,
+        HEADER_H_MM + rows.max(1) as f32 * PORT_ROW_MM + PAD_MM,
+    ]
+}
 
 #[derive(Clone, Copy)]
 pub struct Rect {
@@ -104,24 +115,32 @@ impl GraphView {
         (inputs, outputs, true)
     }
 
+    /// A node's box size `[w, h]` in mm, derived from its descriptor (port counts). The single
+    /// entry point for node size — shared by rendering, hit-testing, and autolayout. When custom
+    /// module UI exists later, this is where a reported size would be substituted.
+    pub fn node_size(&self, node: &Node) -> [f32; 2] {
+        let (ins, outs, _) = self.node_ports(node);
+        size_from_rows(ins.len().max(outs.len()))
+    }
+
     /// Compute geometry for every node from the layout block (center positions). Nodes without a
     /// layout entry get a deterministic staggered fallback so they are at least visible.
     pub fn geoms(&self) -> Vec<NodeGeom> {
         let mut out = Vec::with_capacity(self.patch.nodes.len());
         for (i, node) in self.patch.nodes.iter().enumerate() {
             let (ins, outs, known) = self.node_ports(node);
-            let rows = ins.len().max(outs.len()).max(1) as f32;
-            let h = HEADER_H + rows * PORT_ROW + PAD_BOTTOM;
+            let [w, h] = size_from_rows(ins.len().max(outs.len()));
             let center = self.patch.layout.get(&node.id).map(|p| [p[0] as f32, p[1] as f32]).unwrap_or_else(|| {
-                [((i % 5) as f32) * 200.0 - 400.0, ((i / 5) as f32) * 200.0 - 200.0]
+                [((i % 5) as f32) * 40.0 - 80.0, ((i / 5) as f32) * 40.0 - 40.0]
             });
             let rect = Rect {
-                x: center[0] - NODE_W * 0.5,
+                x: center[0] - w * 0.5,
                 y: center[1] - h * 0.5,
-                w: NODE_W,
+                w,
                 h,
             };
-            let port_y = |idx: usize| rect.y + HEADER_H + idx as f32 * PORT_ROW + PORT_ROW * 0.5;
+            let port_y =
+                |idx: usize| rect.y + HEADER_H_MM + idx as f32 * PORT_ROW_MM + PORT_ROW_MM * 0.5;
             let inputs = ins
                 .into_iter()
                 .enumerate()
@@ -168,7 +187,9 @@ impl GraphView {
         for g in self.geoms() {
             for p in g.inputs.iter().chain(g.outputs.iter()) {
                 let d2 = (p.pos[0] - world[0]).powi(2) + (p.pos[1] - world[1]).powi(2);
-                if d2 <= PORT_HIT_R * PORT_HIT_R && best.as_ref().map_or(true, |(bd, _)| d2 < *bd) {
+                if d2 <= PORT_HIT_R_MM * PORT_HIT_R_MM
+                    && best.as_ref().map_or(true, |(bd, _)| d2 < *bd)
+                {
                     best = Some((
                         d2,
                         PortRef {

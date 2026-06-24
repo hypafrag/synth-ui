@@ -14,7 +14,7 @@ use winit::window::Window;
 use synth_core::module::SignalKind;
 
 use crate::camera::Camera;
-use crate::graph::{NodeGeom, PORT_R};
+use crate::graph::{HEADER_H_MM, NodeGeom, PORT_R_MM};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -47,7 +47,6 @@ const PORT_SAMPLE: [f32; 4] = [0.32, 0.78, 0.66, 1.0];
 const PORT_EVENT: [f32; 4] = [0.92, 0.58, 0.22, 1.0];
 const WIRE: [f32; 4] = [0.74, 0.78, 0.83, 1.0];
 const WIRE_PENDING: [f32; 4] = [0.96, 0.86, 0.28, 1.0];
-const HEADER_H: f32 = 26.0;
 
 // Screen-space toolbar, sized in millimeters (best-effort physical units). Callers pass `scale`
 // = physical pixels per mm (derived from the window scale factor; see `app::App::ui_scale`), and
@@ -55,23 +54,46 @@ const HEADER_H: f32 = 26.0;
 const TOOLBAR_H_MM: f32 = 12.0;
 const BTN_MM: f32 = 8.5;
 const MARGIN_MM: f32 = 1.75;
+const BTN_GAP_MM: f32 = 2.0;
 const TOOLBAR_BG: [f32; 4] = [0.13, 0.14, 0.17, 1.0];
 const BTN_BG: [f32; 4] = [0.22, 0.24, 0.29, 1.0];
 const BTN_BG_HOVER: [f32; 4] = [0.31, 0.34, 0.41, 1.0];
 const ICON_PLAY: [f32; 4] = [0.46, 0.86, 0.52, 1.0];
 const ICON_PAUSE: [f32; 4] = [0.96, 0.82, 0.36, 1.0];
+const ICON_ARRANGE: [f32; 4] = [0.62, 0.74, 0.92, 1.0];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ToolBtn {
+    Play,
+    Arrange,
+}
 
 /// The toolbar bar height in physical pixels.
 pub fn toolbar_height(scale: f32) -> f32 {
     TOOLBAR_H_MM * scale
 }
 
-/// The play/pause button rect `(x, y, w, h)` in physical pixels.
-pub fn play_button_rect(scale: f32) -> (f32, f32, f32, f32) {
+/// A toolbar button's rect `(x, y, w, h)` in physical pixels.
+pub fn button_rect(which: ToolBtn, scale: f32) -> (f32, f32, f32, f32) {
     let b = BTN_MM * scale;
-    let x = MARGIN_MM * scale;
     let y = (TOOLBAR_H_MM - BTN_MM) * 0.5 * scale;
+    let slot = match which {
+        ToolBtn::Play => 0.0,
+        ToolBtn::Arrange => 1.0,
+    };
+    let x = (MARGIN_MM + slot * (BTN_MM + BTN_GAP_MM)) * scale;
     (x, y, b, b)
+}
+
+/// The toolbar button under `screen` (physical pixels), if any.
+pub fn hit_button(screen: [f32; 2], scale: f32) -> Option<ToolBtn> {
+    for which in [ToolBtn::Play, ToolBtn::Arrange] {
+        let (x, y, w, h) = button_rect(which, scale);
+        if screen[0] >= x && screen[0] <= x + w && screen[1] >= y && screen[1] <= y + h {
+            return Some(which);
+        }
+    }
+    None
 }
 
 fn port_color(kind: SignalKind) -> [f32; 4] {
@@ -111,24 +133,46 @@ fn push_tri(v: &mut Vec<Vertex>, a: [f32; 2], b: [f32; 2], c: [f32; 2], color: [
 /// Build the toolbar triangles in physical-pixel coordinates (drawn with the screen-space
 /// uniform). `scale` is physical pixels per mm. Shows a play glyph when stopped, pause when
 /// playing.
-pub fn build_toolbar(viewport: [f32; 2], playing: bool, scale: f32, hovered: bool) -> Vec<Vertex> {
+pub fn build_toolbar(
+    viewport: [f32; 2],
+    playing: bool,
+    scale: f32,
+    hovered: Option<ToolBtn>,
+) -> Vec<Vertex> {
     let mut v = Vec::new();
     let s = scale;
     push_rect(&mut v, 0.0, 0.0, viewport[0], TOOLBAR_H_MM * s, TOOLBAR_BG);
-    let (bx, by, bw, bh) = play_button_rect(s);
-    push_rect(&mut v, bx, by, bw, bh, if hovered { BTN_BG_HOVER } else { BTN_BG });
+
+    // Play / pause: triangle when stopped, two bars when playing.
+    button_bg(&mut v, ToolBtn::Play, s, hovered == Some(ToolBtn::Play));
+    let (bx, by, bw, bh) = button_rect(ToolBtn::Play, s);
     let (cx, cy) = (bx + bw * 0.5, by + bh * 0.5);
     if playing {
-        // Two vertical bars.
         let (w, h, gap) = (1.5 * s, 5.0 * s, 1.4 * s);
         push_rect(&mut v, cx - gap * 0.5 - w, cy - h * 0.5, w, h, ICON_PAUSE);
         push_rect(&mut v, cx + gap * 0.5, cy - h * 0.5, w, h, ICON_PAUSE);
     } else {
-        // Right-pointing triangle.
         let (l, r, hh) = (2.0 * s, 3.0 * s, 2.7 * s);
         push_tri(&mut v, [cx - l, cy - hh], [cx - l, cy + hh], [cx + r, cy], ICON_PLAY);
     }
+
+    // Arrange: three vertical bars of varying height (a "lay out" glyph).
+    button_bg(&mut v, ToolBtn::Arrange, s, hovered == Some(ToolBtn::Arrange));
+    let (ax, ay, aw, ah) = button_rect(ToolBtn::Arrange, s);
+    let (acx, acy) = (ax + aw * 0.5, ay + ah * 0.5);
+    let (bw2, gap2) = (1.2 * s, 1.0 * s);
+    let heights = [3.0 * s, 5.2 * s, 4.0 * s];
+    let mut bx2 = acx - (bw2 * 3.0 + gap2 * 2.0) * 0.5;
+    for h in heights {
+        push_rect(&mut v, bx2, acy - h * 0.5, bw2, h, ICON_ARRANGE);
+        bx2 += bw2 + gap2;
+    }
     v
+}
+
+fn button_bg(v: &mut Vec<Vertex>, which: ToolBtn, scale: f32, hovered: bool) {
+    let (x, y, w, h) = button_rect(which, scale);
+    push_rect(v, x, y, w, h, if hovered { BTN_BG_HOVER } else { BTN_BG });
 }
 
 /// Build triangle and line vertices for the current scene.
@@ -151,14 +195,14 @@ pub fn build_scene(
         } else {
             NODE_HEADER
         };
-        push_rect(&mut tris, r.x, r.y, r.w, HEADER_H, header);
+        push_rect(&mut tris, r.x, r.y, r.w, HEADER_H_MM, header);
         for p in g.inputs.iter().chain(g.outputs.iter()) {
             push_rect(
                 &mut tris,
-                p.pos[0] - PORT_R,
-                p.pos[1] - PORT_R,
-                PORT_R * 2.0,
-                PORT_R * 2.0,
+                p.pos[0] - PORT_R_MM,
+                p.pos[1] - PORT_R_MM,
+                PORT_R_MM * 2.0,
+                PORT_R_MM * 2.0,
                 port_color(p.kind),
             );
         }
@@ -186,6 +230,7 @@ pub struct Renderer {
     bind_group: wgpu::BindGroup,
     ui_uniform_buf: wgpu::Buffer,
     ui_bind_group: wgpu::BindGroup,
+    max_dim: u32,
 }
 
 impl Renderer {
@@ -209,12 +254,19 @@ impl Renderer {
             &wgpu::DeviceDescriptor {
                 label: Some("synth-ui device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                // The adapter's real limits — `downlevel_defaults` caps textures at 2048, too small
+                // for a retina window. On Apple Silicon this is 16384.
+                required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::default(),
             },
             None,
         ))
         .expect("request device");
+
+        // Clamp the surface to the device's max texture size so configure never overflows.
+        let max_dim = device.limits().max_texture_dimension_2d;
+        let width = width.min(max_dim);
+        let height = height.min(max_dim);
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -353,10 +405,13 @@ impl Renderer {
             bind_group,
             ui_uniform_buf,
             ui_bind_group,
+            max_dim,
         }
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
+        let width = width.min(self.max_dim);
+        let height = height.min(self.max_dim);
         if width == 0 || height == 0 {
             return;
         }
@@ -374,7 +429,7 @@ impl Renderer {
         let uniform = Uniform {
             viewport,
             pan: camera.pan,
-            zoom: camera.zoom,
+            zoom: camera.px_per_mm(),
             _pad: [0.0; 3],
         };
         self.queue

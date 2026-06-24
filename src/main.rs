@@ -8,6 +8,7 @@ mod app;
 mod audio;
 mod camera;
 mod graph;
+mod layout;
 mod render;
 
 use winit::event_loop::EventLoop;
@@ -41,13 +42,13 @@ wires:
   - { from: [amp,  out], to: [osc, amplitude] }
   - { from: [osc, out], to: [out, ch0] }
   - { from: [osc, out], to: [out, ch1] }
-layout:
-  freq: [-320, -140]
-  amp:  [-320, 60]
-  osc:  [-60, -60]
-  out:  [260, -60]
-  env:  [-60, 200]
-  vca:  [200, 200]
+layout:                # millimeters, relative to canvas center
+  freq: [-75, -30]
+  amp:  [-75, 5]
+  osc:  [-20, -12]
+  out:  [45, -12]
+  env:  [-20, 45]
+  vca:  [40, 45]
 "#;
 
 fn main() {
@@ -60,7 +61,14 @@ fn main() {
         None => Patch::from_yaml(DEMO).expect("embedded demo patch parses"),
     };
 
+    let mut view = GraphView::new(patch);
+    // Auto-arrange a patch that carries no layout at all; a partial layout is left as authored
+    // (nodes without a position fall back to a staggered placement in `geoms`).
+    if view.patch.layout.is_empty() {
+        layout::autolayout_full(&mut view);
+    }
+
     let event_loop = EventLoop::new().expect("create event loop");
-    let mut app = App::new(GraphView::new(patch));
+    let mut app = App::new(view);
     event_loop.run_app(&mut app).expect("run app");
 }
