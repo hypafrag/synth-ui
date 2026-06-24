@@ -9,3 +9,8 @@ license = "MIT OR Apache-2.0"
 # Committed as a git dependency so a standalone clone of synth-ui builds with no setup.
 # In the dev workspace this is redirected to the local submodule via [patch] (see dev repo Cargo.toml).
 synth-core = { git = "ssh://git@github.com/hypafrag/synth-core.git", branch = "master" }
+
+winit = "0.30"
+wgpu = "22"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
