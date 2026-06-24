@@ -49,6 +49,31 @@ const WIRE: [f32; 4] = [0.74, 0.78, 0.83, 1.0];
 const WIRE_PENDING: [f32; 4] = [0.96, 0.86, 0.28, 1.0];
 const HEADER_H: f32 = 26.0;
 
+// Screen-space toolbar, sized in millimeters (best-effort physical units). Callers pass `scale`
+// = physical pixels per mm (derived from the window scale factor; see `app::App::ui_scale`), and
+// every dimension below is multiplied by it. Top-left origin.
+const TOOLBAR_H_MM: f32 = 12.0;
+const BTN_MM: f32 = 8.5;
+const MARGIN_MM: f32 = 1.75;
+const TOOLBAR_BG: [f32; 4] = [0.13, 0.14, 0.17, 1.0];
+const BTN_BG: [f32; 4] = [0.22, 0.24, 0.29, 1.0];
+const BTN_BG_HOVER: [f32; 4] = [0.31, 0.34, 0.41, 1.0];
+const ICON_PLAY: [f32; 4] = [0.46, 0.86, 0.52, 1.0];
+const ICON_PAUSE: [f32; 4] = [0.96, 0.82, 0.36, 1.0];
+
+/// The toolbar bar height in physical pixels.
+pub fn toolbar_height(scale: f32) -> f32 {
+    TOOLBAR_H_MM * scale
+}
+
+/// The play/pause button rect `(x, y, w, h)` in physical pixels.
+pub fn play_button_rect(scale: f32) -> (f32, f32, f32, f32) {
+    let b = BTN_MM * scale;
+    let x = MARGIN_MM * scale;
+    let y = (TOOLBAR_H_MM - BTN_MM) * 0.5 * scale;
+    (x, y, b, b)
+}
+
 fn port_color(kind: SignalKind) -> [f32; 4] {
     match kind {
         SignalKind::Sample => PORT_SAMPLE,
@@ -75,6 +100,35 @@ fn push_rect(v: &mut Vec<Vertex>, x: f32, y: f32, w: f32, h: f32, color: [f32; 4
 fn push_line(v: &mut Vec<Vertex>, a: [f32; 2], b: [f32; 2], color: [f32; 4]) {
     v.push(Vertex { pos: a, color });
     v.push(Vertex { pos: b, color });
+}
+
+fn push_tri(v: &mut Vec<Vertex>, a: [f32; 2], b: [f32; 2], c: [f32; 2], color: [f32; 4]) {
+    v.push(Vertex { pos: a, color });
+    v.push(Vertex { pos: b, color });
+    v.push(Vertex { pos: c, color });
+}
+
+/// Build the toolbar triangles in physical-pixel coordinates (drawn with the screen-space
+/// uniform). `scale` is physical pixels per mm. Shows a play glyph when stopped, pause when
+/// playing.
+pub fn build_toolbar(viewport: [f32; 2], playing: bool, scale: f32, hovered: bool) -> Vec<Vertex> {
+    let mut v = Vec::new();
+    let s = scale;
+    push_rect(&mut v, 0.0, 0.0, viewport[0], TOOLBAR_H_MM * s, TOOLBAR_BG);
+    let (bx, by, bw, bh) = play_button_rect(s);
+    push_rect(&mut v, bx, by, bw, bh, if hovered { BTN_BG_HOVER } else { BTN_BG });
+    let (cx, cy) = (bx + bw * 0.5, by + bh * 0.5);
+    if playing {
+        // Two vertical bars.
+        let (w, h, gap) = (1.5 * s, 5.0 * s, 1.4 * s);
+        push_rect(&mut v, cx - gap * 0.5 - w, cy - h * 0.5, w, h, ICON_PAUSE);
+        push_rect(&mut v, cx + gap * 0.5, cy - h * 0.5, w, h, ICON_PAUSE);
+    } else {
+        // Right-pointing triangle.
+        let (l, r, hh) = (2.0 * s, 3.0 * s, 2.7 * s);
+        push_tri(&mut v, [cx - l, cy - hh], [cx - l, cy + hh], [cx + r, cy], ICON_PLAY);
+    }
+    v
 }
 
 /// Build triangle and line vertices for the current scene.
@@ -130,6 +184,8 @@ pub struct Renderer {
     line_pipeline: wgpu::RenderPipeline,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    ui_uniform_buf: wgpu::Buffer,
+    ui_bind_group: wgpu::BindGroup,
 }
 
 impl Renderer {
@@ -212,6 +268,23 @@ impl Renderer {
             }],
         });
 
+        // Second uniform/bind group for screen-space UI (pan = viewport/2, zoom = 1, so vertices
+        // are interpreted as raw top-left pixel coordinates by the shared shader).
+        let ui_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui uniform"),
+            size: std::mem::size_of::<Uniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ui_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ui bind group"),
+            layout: &bind_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ui_uniform_buf.as_entire_binding(),
+            }],
+        });
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("canvas pipeline layout"),
             bind_group_layouts: &[&bind_layout],
@@ -278,6 +351,8 @@ impl Renderer {
             line_pipeline,
             uniform_buf,
             bind_group,
+            ui_uniform_buf,
+            ui_bind_group,
         }
     }
 
@@ -294,15 +369,24 @@ impl Renderer {
         [self.config.width as f32, self.config.height as f32]
     }
 
-    pub fn render(&mut self, camera: &Camera, tris: &[Vertex], lines: &[Vertex]) {
+    pub fn render(&mut self, camera: &Camera, tris: &[Vertex], lines: &[Vertex], ui_tris: &[Vertex]) {
+        let viewport = self.viewport();
         let uniform = Uniform {
-            viewport: self.viewport(),
+            viewport,
             pan: camera.pan,
             zoom: camera.zoom,
             _pad: [0.0; 3],
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
+        let ui_uniform = Uniform {
+            viewport,
+            pan: [viewport[0] * 0.5, viewport[1] * 0.5],
+            zoom: 1.0,
+            _pad: [0.0; 3],
+        };
+        self.queue
+            .write_buffer(&self.ui_uniform_buf, 0, bytemuck::bytes_of(&ui_uniform));
 
         let tri_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tri verts"),
@@ -312,6 +396,11 @@ impl Renderer {
         let line_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("line verts"),
             contents: bytemuck::cast_slice(lines),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let ui_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ui verts"),
+            contents: bytemuck::cast_slice(ui_tris),
             usage: wgpu::BufferUsages::VERTEX,
         });
 
@@ -356,6 +445,13 @@ impl Renderer {
                 pass.set_pipeline(&self.line_pipeline);
                 pass.set_vertex_buffer(0, line_buf.slice(..));
                 pass.draw(0..lines.len() as u32, 0..1);
+            }
+            // Screen-space UI (toolbar) on top, using the UI bind group.
+            if !ui_tris.is_empty() {
+                pass.set_pipeline(&self.tri_pipeline);
+                pass.set_bind_group(0, &self.ui_bind_group, &[]);
+                pass.set_vertex_buffer(0, ui_buf.slice(..));
+                pass.draw(0..ui_tris.len() as u32, 0..1);
             }
         }
         self.queue.submit(Some(encoder.finish()));

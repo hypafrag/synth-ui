@@ -20,7 +20,7 @@ use winit::window::{Window, WindowId};
 use crate::audio::Audio;
 use crate::camera::Camera;
 use crate::graph::{GraphView, PortRef};
-use crate::render::{Renderer, build_scene};
+use crate::render::{self, Renderer, build_scene};
 
 #[derive(Clone, Default)]
 enum Drag {
@@ -37,6 +37,11 @@ enum Drag {
     },
 }
 
+/// Logical pixels per millimeter at scale factor 1.0, using the conventional 96 px/inch
+/// reference (the same approximation CSS uses). Best-effort: exact when the OS's logical pixels
+/// track real size.
+const LOGICAL_PX_PER_MM: f32 = 96.0 / 25.4;
+
 pub struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -46,6 +51,10 @@ pub struct App {
     cursor: [f32; 2],
     drag: Drag,
     hover_id: Option<String>,
+    /// Whether the cursor is over the play/pause button.
+    btn_hover: bool,
+    /// Physical pixels per mm: `scale_factor * LOGICAL_PX_PER_MM`.
+    ui_scale: f32,
 }
 
 impl App {
@@ -59,6 +68,8 @@ impl App {
             cursor: [0.0, 0.0],
             drag: Drag::None,
             hover_id: None,
+            btn_hover: false,
+            ui_scale: LOGICAL_PX_PER_MM,
         }
     }
 
@@ -107,6 +118,11 @@ impl App {
     fn on_cursor(&mut self, p: [f32; 2]) {
         let delta = [p[0] - self.cursor[0], p[1] - self.cursor[1]];
         self.cursor = p;
+        let over_btn = self.over_play_button(p);
+        if over_btn != self.btn_hover {
+            self.btn_hover = over_btn;
+            self.redraw();
+        }
         let world = self.cursor_world();
         match self.drag.clone() {
             Drag::Pan => {
@@ -130,7 +146,26 @@ impl App {
         }
     }
 
+    /// True if `screen` (physical pixels) is over the play/pause button.
+    fn over_play_button(&self, screen: [f32; 2]) -> bool {
+        let (x, y, w, h) = render::play_button_rect(self.ui_scale);
+        screen[0] >= x && screen[0] <= x + w && screen[1] >= y && screen[1] <= y + h
+    }
+
     fn on_mouse(&mut self, state: ElementState, button: MouseButton) {
+        // Toolbar clicks are handled in screen space and never reach the canvas.
+        if state == ElementState::Pressed && button == MouseButton::Left {
+            if self.over_play_button(self.cursor) {
+                self.audio.toggle(&self.view.patch, &self.view.registry);
+                self.update_title();
+                self.redraw();
+                return;
+            }
+            if self.cursor[1] < render::toolbar_height(self.ui_scale) {
+                return; // swallow clicks on the toolbar bar (no pan)
+            }
+        }
+
         let world = self.cursor_world();
         match (state, button) {
             (ElementState::Pressed, MouseButton::Left) => {
@@ -207,7 +242,8 @@ impl App {
         };
         let (tris, lines) = build_scene(&geoms, &wires, pending, hover);
         if let Some(r) = &mut self.renderer {
-            r.render(&self.camera, &tris, &lines);
+            let ui = render::build_toolbar(r.viewport(), self.audio.playing, self.ui_scale, self.btn_hover);
+            r.render(&self.camera, &tris, &lines, &ui);
         }
     }
 }
@@ -221,6 +257,7 @@ impl ApplicationHandler for App {
             el.create_window(Window::default_attributes().with_title("synth-ui   [stopped]"))
                 .expect("create window"),
         );
+        self.ui_scale = window.scale_factor() as f32 * LOGICAL_PX_PER_MM;
         self.renderer = Some(Renderer::new(window.clone()));
         self.window = Some(window);
         self.redraw();
@@ -233,6 +270,10 @@ impl ApplicationHandler for App {
                 if let Some(r) = &mut self.renderer {
                     r.resize(size.width, size.height);
                 }
+                self.redraw();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.ui_scale = scale_factor as f32 * LOGICAL_PX_PER_MM;
                 self.redraw();
             }
             WindowEvent::RedrawRequested => self.draw(),
