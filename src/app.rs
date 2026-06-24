@@ -9,8 +9,10 @@
 //! - Space — start/stop audio
 //! Hovered module name shows in the window title (no in-canvas text yet).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use synth_core::module::Icon;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
@@ -49,6 +51,9 @@ pub struct App {
     hover_id: Option<String>,
     /// Which toolbar button the cursor is over, if any.
     hover_btn: Option<ToolBtn>,
+    /// Module icon atlas: the distinct icons and a `type_id → atlas index` map.
+    icon_list: Vec<Icon>,
+    icon_index: HashMap<String, usize>,
 }
 
 /// Physical pixels per mm for the given window scale factor (the chrome/world mm→px scale).
@@ -58,6 +63,7 @@ fn ui_scale_for(scale_factor: f64) -> f32 {
 
 impl App {
     pub fn new(view: GraphView) -> Self {
+        let (icon_list, icon_index) = view.icon_atlas();
         Self {
             window: None,
             renderer: None,
@@ -68,6 +74,8 @@ impl App {
             drag: Drag::None,
             hover_id: None,
             hover_btn: None,
+            icon_list,
+            icon_index,
         }
     }
 
@@ -243,9 +251,10 @@ impl App {
             _ => None,
         };
         let (tris, lines) = build_scene(&geoms, &wires, pending, hover);
+        let icons = render::build_icons(&geoms, &self.icon_index, self.icon_list.len());
         if let Some(r) = &mut self.renderer {
             let ui = render::build_toolbar(r.viewport(), self.audio.playing, self.camera.ui_scale, self.hover_btn);
-            r.render(&self.camera, &tris, &lines, &ui);
+            r.render(&self.camera, &tris, &lines, &ui, &icons);
         }
     }
 }
@@ -260,7 +269,9 @@ impl ApplicationHandler for App {
                 .expect("create window"),
         );
         self.camera.ui_scale = ui_scale_for(window.scale_factor());
-        self.renderer = Some(Renderer::new(window.clone()));
+        let mut renderer = Renderer::new(window.clone());
+        renderer.set_icons(&self.icon_list);
+        self.renderer = Some(renderer);
         self.window = Some(window);
         self.redraw();
     }

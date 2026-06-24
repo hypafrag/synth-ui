@@ -5,13 +5,14 @@
 //! (see `docs/architecture/12-ui-rendering.md`). No text yet — module names surface in the
 //! window title.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use synth_core::module::SignalKind;
+use synth_core::module::{Icon, SignalKind};
 
 use crate::camera::Camera;
 use crate::graph::{HEADER_H_MM, NodeGeom, PORT_R_MM};
@@ -21,6 +22,13 @@ use crate::graph::{HEADER_H_MM, NodeGeom, PORT_R_MM};
 pub struct Vertex {
     pos: [f32; 2],
     color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct IconVertex {
+    pos: [f32; 2],
+    uv: [f32; 2],
 }
 
 #[repr(C)]
@@ -95,6 +103,10 @@ pub fn hit_button(screen: [f32; 2], scale: f32) -> Option<ToolBtn> {
     }
     None
 }
+
+// Icon quad size and inset from the node's top-left corner, in mm.
+const ICON_MM: f32 = 4.2;
+const ICON_INSET_MM: f32 = 1.0;
 
 fn port_color(kind: SignalKind) -> [f32; 4] {
     match kind {
@@ -219,6 +231,38 @@ pub fn build_scene(
     (tris, lines)
 }
 
+/// Icon quads (one per node) in the node's top-left corner, with UVs into the icon atlas band.
+pub fn build_icons(
+    geoms: &[NodeGeom],
+    index: &HashMap<String, usize>,
+    count: usize,
+) -> Vec<IconVertex> {
+    let mut v = Vec::new();
+    if count == 0 {
+        return v;
+    }
+    let inv = 1.0 / count as f32;
+    for g in geoms {
+        let idx = index.get(&g.ty).copied().unwrap_or(0);
+        let (v0, v1) = (idx as f32 * inv, (idx + 1) as f32 * inv);
+        let (x0, y0) = (g.rect.x + ICON_INSET_MM, g.rect.y + ICON_INSET_MM);
+        let (x1, y1) = (x0 + ICON_MM, y0 + ICON_MM);
+        let p = |x, y, u, w| IconVertex {
+            pos: [x, y],
+            uv: [u, w],
+        };
+        v.extend_from_slice(&[
+            p(x0, y0, 0.0, v0),
+            p(x1, y0, 1.0, v0),
+            p(x1, y1, 1.0, v1),
+            p(x0, y0, 0.0, v0),
+            p(x1, y1, 1.0, v1),
+            p(x0, y1, 0.0, v1),
+        ]);
+    }
+    v
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -230,6 +274,10 @@ pub struct Renderer {
     bind_group: wgpu::BindGroup,
     ui_uniform_buf: wgpu::Buffer,
     ui_bind_group: wgpu::BindGroup,
+    icon_pipeline: wgpu::RenderPipeline,
+    icon_tex_layout: wgpu::BindGroupLayout,
+    icon_sampler: wgpu::Sampler,
+    icon_atlas: Option<(wgpu::BindGroup, usize)>,
     max_dim: u32,
 }
 
@@ -394,6 +442,86 @@ impl Renderer {
         let tri_pipeline = make_pipeline(wgpu::PrimitiveTopology::TriangleList);
         let line_pipeline = make_pipeline(wgpu::PrimitiveTopology::LineList);
 
+        // Icon pass: a textured quad per node sampling the icon atlas with a nearest filter.
+        let icon_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("icon shader"),
+            source: wgpu::ShaderSource::Wgsl(ICON_SHADER.into()),
+        });
+        let icon_tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("icon texture layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let icon_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("icon sampler (nearest)"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let icon_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("icon pipeline layout"),
+                bind_group_layouts: &[&bind_layout, &icon_tex_layout],
+                push_constant_ranges: &[],
+            });
+        let icon_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("icon pipeline"),
+            layout: Some(&icon_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &icon_shader,
+                entry_point: "vs",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<IconVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 8,
+                            shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &icon_shader,
+                entry_point: "fs",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         Self {
             surface,
             device,
@@ -405,8 +533,85 @@ impl Renderer {
             bind_group,
             ui_uniform_buf,
             ui_bind_group,
+            icon_pipeline,
+            icon_tex_layout,
+            icon_sampler,
+            icon_atlas: None,
             max_dim,
         }
+    }
+
+    /// Upload the module icons into the atlas texture (one 32×32 band per icon, stacked
+    /// vertically) and build the icon bind group. Call once after construction.
+    pub fn set_icons(&mut self, icons: &[Icon]) {
+        let count = icons.len();
+        if count == 0 {
+            self.icon_atlas = None;
+            return;
+        }
+        let (w, h) = (32u32, 32 * count as u32);
+        // write_texture requires bytes_per_row to be a multiple of 256; pad each row.
+        let stride = 256usize;
+        let mut data = vec![0u8; stride * h as usize];
+        for (i, icon) in icons.iter().enumerate() {
+            for (row, &bits) in icon.iter().enumerate() {
+                let y = i * 32 + row;
+                for x in 0..32u32 {
+                    if (bits >> (31 - x)) & 1 == 1 {
+                        data[y * stride + x as usize] = 255;
+                    }
+                }
+            }
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("icon atlas"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(stride as u32),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("icon atlas bind"),
+            layout: &self.icon_tex_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.icon_sampler),
+                },
+            ],
+        });
+        self.icon_atlas = Some((bind, count));
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -424,7 +629,14 @@ impl Renderer {
         [self.config.width as f32, self.config.height as f32]
     }
 
-    pub fn render(&mut self, camera: &Camera, tris: &[Vertex], lines: &[Vertex], ui_tris: &[Vertex]) {
+    pub fn render(
+        &mut self,
+        camera: &Camera,
+        tris: &[Vertex],
+        lines: &[Vertex],
+        ui_tris: &[Vertex],
+        icon_verts: &[IconVertex],
+    ) {
         let viewport = self.viewport();
         let uniform = Uniform {
             viewport,
@@ -457,6 +669,13 @@ impl Renderer {
             label: Some("ui verts"),
             contents: bytemuck::cast_slice(ui_tris),
             usage: wgpu::BufferUsages::VERTEX,
+        });
+        let icon_buf = (!icon_verts.is_empty()).then(|| {
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("icon verts"),
+                contents: bytemuck::cast_slice(icon_verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
         });
 
         let frame = match self.surface.get_current_texture() {
@@ -495,6 +714,14 @@ impl Renderer {
                 pass.set_pipeline(&self.tri_pipeline);
                 pass.set_vertex_buffer(0, tri_buf.slice(..));
                 pass.draw(0..tris.len() as u32, 0..1);
+            }
+            // Module icons, on top of node bodies (camera-space, nearest-sampled atlas).
+            if let (Some((bind, _)), Some(buf)) = (&self.icon_atlas, &icon_buf) {
+                pass.set_pipeline(&self.icon_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_bind_group(1, bind, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..icon_verts.len() as u32, 0..1);
             }
             if !lines.is_empty() {
                 pass.set_pipeline(&self.line_pipeline);
@@ -545,5 +772,40 @@ fn vs(@location(0) p: vec2<f32>, @location(1) c: vec4<f32>) -> VOut {
 @fragment
 fn fs(i: VOut) -> @location(0) vec4<f32> {
     return i.color;
+}
+"#;
+
+const ICON_SHADER: &str = r#"
+struct U {
+    viewport: vec2<f32>,
+    pan: vec2<f32>,
+    zoom: f32,
+    pad0: f32,
+    pad1: f32,
+    pad2: f32,
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(1) @binding(0) var tex: texture_2d<f32>;
+@group(1) @binding(1) var samp: sampler;
+
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs(@location(0) p: vec2<f32>, @location(1) uv: vec2<f32>) -> VOut {
+    let screen = (p - u.pan) * u.zoom + u.viewport * 0.5;
+    let ndc = vec2<f32>(screen.x / u.viewport.x * 2.0 - 1.0, 1.0 - screen.y / u.viewport.y * 2.0);
+    var o: VOut;
+    o.pos = vec4<f32>(ndc, 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+
+@fragment
+fn fs(i: VOut) -> @location(0) vec4<f32> {
+    let a = textureSample(tex, samp, i.uv).r;
+    return vec4<f32>(0.86, 0.89, 0.94, a);
 }
 "#;

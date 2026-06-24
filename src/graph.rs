@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use synth_core::model::{Endpoint, Node, Patch, Wire};
-use synth_core::module::{Registry, SignalKind};
+use synth_core::module::{Icon, Registry, SignalKind, icons};
 
 // Node geometry constants, in millimeters (the world unit; see 12-ui-rendering.md). Shared by
 // hit-testing, rendering, and autolayout so they agree. Tweak any of these to resize uniformly.
@@ -58,6 +58,7 @@ pub struct PortGeom {
 #[derive(Clone)]
 pub struct NodeGeom {
     pub id: String,
+    pub ty: String,
     pub known: bool,
     pub rect: Rect,
     pub inputs: Vec<PortGeom>,
@@ -163,6 +164,7 @@ impl GraphView {
                 .collect();
             out.push(NodeGeom {
                 id: node.id.clone(),
+                ty: node.ty.clone(),
                 known,
                 rect,
                 inputs,
@@ -170,6 +172,26 @@ impl GraphView {
             });
         }
         out
+    }
+
+    /// Distinct icons for the patch's node types and a `type_id → atlas index` map.
+    /// `audio_output` (engine-special) and unknown types get their fallback icons.
+    pub fn icon_atlas(&self) -> (Vec<Icon>, HashMap<String, usize>) {
+        let mut list = Vec::new();
+        let mut map = HashMap::new();
+        for node in &self.patch.nodes {
+            if map.contains_key(&node.ty) {
+                continue;
+            }
+            let icon = if node.ty == "audio_output" {
+                icons::AUDIO_OUTPUT
+            } else {
+                self.registry.icon(&node.ty).unwrap_or(icons::UNKNOWN)
+            };
+            map.insert(node.ty.clone(), list.len());
+            list.push(icon);
+        }
+        (list, map)
     }
 
     /// The topmost node whose body contains `world`, if any (last drawn = topmost).
