@@ -229,6 +229,30 @@ impl GraphView {
         best.map(|(_, r)| r)
     }
 
+    /// Add a new node of type `ty` at world `center` (mm), with no params. Returns the generated
+    /// id, unique within the patch (`"{ty}-{n}"` for the smallest free `n`). Used by the palette's
+    /// drag-to-add. Unknown/incomplete types are allowed — they render with the "unknown" header
+    /// until configured, matching how the editor already tolerates partial patches.
+    pub fn add_node(&mut self, ty: &str, center: [f32; 2]) -> String {
+        let mut n = 1;
+        let id = loop {
+            let candidate = format!("{ty}-{n}");
+            if !self.patch.nodes.iter().any(|node| node.id == candidate) {
+                break candidate;
+            }
+            n += 1;
+        };
+        self.patch.nodes.push(Node {
+            id: id.clone(),
+            ty: ty.to_string(),
+            params: Default::default(),
+        });
+        self.patch
+            .layout
+            .insert(id.clone(), [center[0] as f64, center[1] as f64]);
+        id
+    }
+
     /// Move a node to a new center position (updates the layout block).
     pub fn move_node(&mut self, id: &str, center: [f32; 2]) {
         self.patch
@@ -290,5 +314,30 @@ impl GraphView {
             }
         }
         segs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_view() -> GraphView {
+        GraphView::new(Patch::from_yaml("version: 1\nnodes: []\nwires: []\n").unwrap())
+    }
+
+    #[test]
+    fn add_node_inserts_with_layout_and_unique_id() {
+        let mut view = empty_view();
+        let a = view.add_node("sine_generator", [10.0, -5.0]);
+        let b = view.add_node("sine_generator", [20.0, 5.0]);
+
+        // Two distinct nodes with distinct ids.
+        assert_ne!(a, b);
+        assert_eq!(view.patch.nodes.len(), 2);
+        assert!(view.patch.nodes.iter().any(|n| n.id == a && n.ty == "sine_generator"));
+
+        // Each id has a layout entry at the requested center.
+        assert_eq!(view.patch.layout.get(&a), Some(&[10.0, -5.0]));
+        assert_eq!(view.patch.layout.get(&b), Some(&[20.0, 5.0]));
     }
 }

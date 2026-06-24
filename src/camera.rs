@@ -4,6 +4,11 @@
 //! unitless magnification, and `ui_scale` is the display's physical pixels per mm at zoom 1.0, so
 //! the on-screen pixels-per-mm is `zoom * ui_scale`. Pan is unlimited; zoom is clamped. All screen
 //! coordinates are physical pixels, matching winit cursor positions and the wgpu surface size.
+//!
+//! The canvas does not own the whole window — egui chrome (`docs/architecture/12-ui-rendering.md`)
+//! docks panels around a central region. Coordinate mapping is therefore relative to the **canvas
+//! rect** `[x, y, w, h]` (physical px, within the surface): the camera's `pan` world point sits at
+//! the rect's center, not the window center. Pass the current central rect to the methods below.
 
 pub const MIN_ZOOM: f32 = 0.15;
 pub const MAX_ZOOM: f32 = 5.0;
@@ -39,19 +44,24 @@ impl Camera {
         self.zoom * self.ui_scale
     }
 
-    pub fn screen_to_world(&self, screen: [f32; 2], viewport: [f32; 2]) -> [f32; 2] {
+    /// Map a screen point (physical px, full-window) to world mm, relative to the canvas `rect`
+    /// `[x, y, w, h]` (physical px). The `pan` world point maps to the rect's center.
+    pub fn screen_to_world(&self, screen: [f32; 2], rect: [f32; 4]) -> [f32; 2] {
         let e = self.px_per_mm();
+        let cx = rect[0] + rect[2] * 0.5;
+        let cy = rect[1] + rect[3] * 0.5;
         [
-            (screen[0] - viewport[0] * 0.5) / e + self.pan[0],
-            (screen[1] - viewport[1] * 0.5) / e + self.pan[1],
+            (screen[0] - cx) / e + self.pan[0],
+            (screen[1] - cy) / e + self.pan[1],
         ]
     }
 
-    /// Zoom toward `anchor` (a screen point), keeping the world point under it fixed.
-    pub fn zoom_at(&mut self, anchor: [f32; 2], viewport: [f32; 2], factor: f32) {
-        let before = self.screen_to_world(anchor, viewport);
+    /// Zoom toward `anchor` (a screen point), keeping the world point under it fixed. `rect` is the
+    /// canvas rect `[x, y, w, h]` in physical px.
+    pub fn zoom_at(&mut self, anchor: [f32; 2], rect: [f32; 4], factor: f32) {
+        let before = self.screen_to_world(anchor, rect);
         self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
-        let after = self.screen_to_world(anchor, viewport);
+        let after = self.screen_to_world(anchor, rect);
         self.pan[0] += before[0] - after[0];
         self.pan[1] += before[1] - after[1];
     }

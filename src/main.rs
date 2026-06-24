@@ -7,6 +7,7 @@
 mod app;
 mod audio;
 mod camera;
+mod chrome;
 mod graph;
 mod layout;
 mod render;

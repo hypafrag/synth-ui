@@ -1,9 +1,13 @@
-//! Custom wgpu canvas renderer.
+//! Custom wgpu canvas renderer + egui chrome compositing.
 //!
-//! Draws the graph as flat geometry: node bodies/headers/ports as triangles and wires as lines,
-//! all in world coordinates transformed to the screen by a camera uniform in the vertex shader
-//! (see `docs/architecture/12-ui-rendering.md`). No text yet — module names surface in the
-//! window title.
+//! The frame is two sequential passes into one surface view, one command encoder, one submit
+//! (see `docs/architecture/12-ui-rendering.md`):
+//!   pass 1 — canvas: clear, scissored to the central canvas rect; instanced node geometry,
+//!            icons, and wires in world coordinates via a camera uniform.
+//!   pass 2 — egui:   load (no clear), full surface; menu/toolbar/status bars + dockable panels.
+//!
+//! The canvas no longer owns the whole window: egui docks panels around a central region, so the
+//! camera uniform carries that region's rect and the canvas pass is scissored to it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,10 +38,24 @@ pub struct IconVertex {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniform {
-    viewport: [f32; 2],
+    /// Full surface size in physical px (used to normalize to NDC).
+    surface: [f32; 2],
+    /// Canvas rect top-left in physical px, within the surface.
+    canvas_origin: [f32; 2],
+    /// Canvas rect size in physical px.
+    canvas_size: [f32; 2],
+    /// World point (mm) shown at the canvas-rect center.
     pan: [f32; 2],
+    /// On-screen physical px per world mm.
     zoom: f32,
     _pad: [f32; 3],
+}
+
+/// The tessellated egui chrome for one frame, handed to [`Renderer::render`].
+pub struct EguiFrame {
+    pub textures_delta: egui::TexturesDelta,
+    pub paint_jobs: Vec<egui::epaint::ClippedPrimitive>,
+    pub pixels_per_point: f32,
 }
 
 // Palette.
@@ -55,54 +73,6 @@ const PORT_SAMPLE: [f32; 4] = [0.32, 0.78, 0.66, 1.0];
 const PORT_EVENT: [f32; 4] = [0.92, 0.58, 0.22, 1.0];
 const WIRE: [f32; 4] = [0.74, 0.78, 0.83, 1.0];
 const WIRE_PENDING: [f32; 4] = [0.96, 0.86, 0.28, 1.0];
-
-// Screen-space toolbar, sized in millimeters (best-effort physical units). Callers pass `scale`
-// = physical pixels per mm (derived from the window scale factor; see `app::App::ui_scale`), and
-// every dimension below is multiplied by it. Top-left origin.
-const TOOLBAR_H_MM: f32 = 12.0;
-const BTN_MM: f32 = 8.5;
-const MARGIN_MM: f32 = 1.75;
-const BTN_GAP_MM: f32 = 2.0;
-const TOOLBAR_BG: [f32; 4] = [0.13, 0.14, 0.17, 1.0];
-const BTN_BG: [f32; 4] = [0.22, 0.24, 0.29, 1.0];
-const BTN_BG_HOVER: [f32; 4] = [0.31, 0.34, 0.41, 1.0];
-const ICON_PLAY: [f32; 4] = [0.46, 0.86, 0.52, 1.0];
-const ICON_PAUSE: [f32; 4] = [0.96, 0.82, 0.36, 1.0];
-const ICON_ARRANGE: [f32; 4] = [0.62, 0.74, 0.92, 1.0];
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ToolBtn {
-    Play,
-    Arrange,
-}
-
-/// The toolbar bar height in physical pixels.
-pub fn toolbar_height(scale: f32) -> f32 {
-    TOOLBAR_H_MM * scale
-}
-
-/// A toolbar button's rect `(x, y, w, h)` in physical pixels.
-pub fn button_rect(which: ToolBtn, scale: f32) -> (f32, f32, f32, f32) {
-    let b = BTN_MM * scale;
-    let y = (TOOLBAR_H_MM - BTN_MM) * 0.5 * scale;
-    let slot = match which {
-        ToolBtn::Play => 0.0,
-        ToolBtn::Arrange => 1.0,
-    };
-    let x = (MARGIN_MM + slot * (BTN_MM + BTN_GAP_MM)) * scale;
-    (x, y, b, b)
-}
-
-/// The toolbar button under `screen` (physical pixels), if any.
-pub fn hit_button(screen: [f32; 2], scale: f32) -> Option<ToolBtn> {
-    for which in [ToolBtn::Play, ToolBtn::Arrange] {
-        let (x, y, w, h) = button_rect(which, scale);
-        if screen[0] >= x && screen[0] <= x + w && screen[1] >= y && screen[1] <= y + h {
-            return Some(which);
-        }
-    }
-    None
-}
 
 // Icon quad size and inset from the node's top-left corner, in mm.
 const ICON_MM: f32 = 4.2;
@@ -134,57 +104,6 @@ fn push_rect(v: &mut Vec<Vertex>, x: f32, y: f32, w: f32, h: f32, color: [f32; 4
 fn push_line(v: &mut Vec<Vertex>, a: [f32; 2], b: [f32; 2], color: [f32; 4]) {
     v.push(Vertex { pos: a, color });
     v.push(Vertex { pos: b, color });
-}
-
-fn push_tri(v: &mut Vec<Vertex>, a: [f32; 2], b: [f32; 2], c: [f32; 2], color: [f32; 4]) {
-    v.push(Vertex { pos: a, color });
-    v.push(Vertex { pos: b, color });
-    v.push(Vertex { pos: c, color });
-}
-
-/// Build the toolbar triangles in physical-pixel coordinates (drawn with the screen-space
-/// uniform). `scale` is physical pixels per mm. Shows a play glyph when stopped, pause when
-/// playing.
-pub fn build_toolbar(
-    viewport: [f32; 2],
-    playing: bool,
-    scale: f32,
-    hovered: Option<ToolBtn>,
-) -> Vec<Vertex> {
-    let mut v = Vec::new();
-    let s = scale;
-    push_rect(&mut v, 0.0, 0.0, viewport[0], TOOLBAR_H_MM * s, TOOLBAR_BG);
-
-    // Play / pause: triangle when stopped, two bars when playing.
-    button_bg(&mut v, ToolBtn::Play, s, hovered == Some(ToolBtn::Play));
-    let (bx, by, bw, bh) = button_rect(ToolBtn::Play, s);
-    let (cx, cy) = (bx + bw * 0.5, by + bh * 0.5);
-    if playing {
-        let (w, h, gap) = (1.5 * s, 5.0 * s, 1.4 * s);
-        push_rect(&mut v, cx - gap * 0.5 - w, cy - h * 0.5, w, h, ICON_PAUSE);
-        push_rect(&mut v, cx + gap * 0.5, cy - h * 0.5, w, h, ICON_PAUSE);
-    } else {
-        let (l, r, hh) = (2.0 * s, 3.0 * s, 2.7 * s);
-        push_tri(&mut v, [cx - l, cy - hh], [cx - l, cy + hh], [cx + r, cy], ICON_PLAY);
-    }
-
-    // Arrange: three vertical bars of varying height (a "lay out" glyph).
-    button_bg(&mut v, ToolBtn::Arrange, s, hovered == Some(ToolBtn::Arrange));
-    let (ax, ay, aw, ah) = button_rect(ToolBtn::Arrange, s);
-    let (acx, acy) = (ax + aw * 0.5, ay + ah * 0.5);
-    let (bw2, gap2) = (1.2 * s, 1.0 * s);
-    let heights = [3.0 * s, 5.2 * s, 4.0 * s];
-    let mut bx2 = acx - (bw2 * 3.0 + gap2 * 2.0) * 0.5;
-    for h in heights {
-        push_rect(&mut v, bx2, acy - h * 0.5, bw2, h, ICON_ARRANGE);
-        bx2 += bw2 + gap2;
-    }
-    v
-}
-
-fn button_bg(v: &mut Vec<Vertex>, which: ToolBtn, scale: f32, hovered: bool) {
-    let (x, y, w, h) = button_rect(which, scale);
-    push_rect(v, x, y, w, h, if hovered { BTN_BG_HOVER } else { BTN_BG });
 }
 
 /// Build triangle and line vertices for the current scene.
@@ -272,12 +191,11 @@ pub struct Renderer {
     line_pipeline: wgpu::RenderPipeline,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    ui_uniform_buf: wgpu::Buffer,
-    ui_bind_group: wgpu::BindGroup,
     icon_pipeline: wgpu::RenderPipeline,
     icon_tex_layout: wgpu::BindGroupLayout,
     icon_sampler: wgpu::Sampler,
     icon_atlas: Option<(wgpu::BindGroup, usize)>,
+    egui_renderer: egui_wgpu::Renderer,
     max_dim: u32,
 }
 
@@ -365,23 +283,6 @@ impl Renderer {
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: uniform_buf.as_entire_binding(),
-            }],
-        });
-
-        // Second uniform/bind group for screen-space UI (pan = viewport/2, zoom = 1, so vertices
-        // are interpreted as raw top-left pixel coordinates by the shared shader).
-        let ui_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ui uniform"),
-            size: std::mem::size_of::<Uniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let ui_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ui bind group"),
-            layout: &bind_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: ui_uniform_buf.as_entire_binding(),
             }],
         });
 
@@ -522,6 +423,9 @@ impl Renderer {
             cache: None,
         });
 
+        // egui composites onto the surface format, no depth, no MSAA, no dithering.
+        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
+
         Self {
             surface,
             device,
@@ -531,18 +435,18 @@ impl Renderer {
             line_pipeline,
             uniform_buf,
             bind_group,
-            ui_uniform_buf,
-            ui_bind_group,
             icon_pipeline,
             icon_tex_layout,
             icon_sampler,
             icon_atlas: None,
+            egui_renderer,
             max_dim,
         }
     }
 
     /// Upload the module icons into the atlas texture (one 32×32 band per icon, stacked
-    /// vertically) and build the icon bind group. Call once after construction.
+    /// vertically) and build the icon bind group. Call once after construction and again whenever
+    /// the set of node types changes (e.g. a new module is added from the palette).
     pub fn set_icons(&mut self, icons: &[Icon]) {
         let count = icons.len();
         if count == 0 {
@@ -629,31 +533,28 @@ impl Renderer {
         [self.config.width as f32, self.config.height as f32]
     }
 
+    /// Render one frame: the canvas (scissored to `canvas_rect`, physical px `[x, y, w, h]`) then
+    /// the egui chrome on top.
     pub fn render(
         &mut self,
         camera: &Camera,
+        canvas_rect: [f32; 4],
         tris: &[Vertex],
         lines: &[Vertex],
-        ui_tris: &[Vertex],
         icon_verts: &[IconVertex],
+        egui: EguiFrame,
     ) {
-        let viewport = self.viewport();
+        let surface = self.viewport();
         let uniform = Uniform {
-            viewport,
+            surface,
+            canvas_origin: [canvas_rect[0], canvas_rect[1]],
+            canvas_size: [canvas_rect[2], canvas_rect[3]],
             pan: camera.pan,
             zoom: camera.px_per_mm(),
             _pad: [0.0; 3],
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
-        let ui_uniform = Uniform {
-            viewport,
-            pan: [viewport[0] * 0.5, viewport[1] * 0.5],
-            zoom: 1.0,
-            _pad: [0.0; 3],
-        };
-        self.queue
-            .write_buffer(&self.ui_uniform_buf, 0, bytemuck::bytes_of(&ui_uniform));
 
         let tri_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tri verts"),
@@ -665,11 +566,6 @@ impl Renderer {
             contents: bytemuck::cast_slice(lines),
             usage: wgpu::BufferUsages::VERTEX,
         });
-        let ui_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("ui verts"),
-            contents: bytemuck::cast_slice(ui_tris),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
         let icon_buf = (!icon_verts.is_empty()).then(|| {
             self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("icon verts"),
@@ -677,6 +573,20 @@ impl Renderer {
                 usage: wgpu::BufferUsages::VERTEX,
             })
         });
+
+        // Scissor the canvas pass to the central rect, clamped to the surface. An empty rect skips
+        // the canvas geometry entirely (panels cover the whole window).
+        let (sw, sh) = (self.config.width, self.config.height);
+        let sx = (canvas_rect[0].max(0.0) as u32).min(sw);
+        let sy = (canvas_rect[1].max(0.0) as u32).min(sh);
+        let sgw = (canvas_rect[2].max(0.0) as u32).min(sw - sx);
+        let sgh = (canvas_rect[3].max(0.0) as u32).min(sh - sy);
+        let canvas_visible = sgw > 0 && sgh > 0;
+
+        let screen_desc = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [sw, sh],
+            pixels_per_point: egui.pixels_per_point,
+        };
 
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
@@ -694,6 +604,21 @@ impl Renderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        // egui buffer/texture uploads happen on the same encoder, before its pass.
+        for (id, delta) in &egui.textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, delta);
+        }
+        let egui_cmds = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &egui.paint_jobs,
+            &screen_desc,
+        );
+
+        // Pass 1 — canvas (clear), scissored to the central rect.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("canvas pass"),
@@ -709,43 +634,67 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            if !tris.is_empty() {
-                pass.set_pipeline(&self.tri_pipeline);
-                pass.set_vertex_buffer(0, tri_buf.slice(..));
-                pass.draw(0..tris.len() as u32, 0..1);
-            }
-            // Module icons, on top of node bodies (camera-space, nearest-sampled atlas).
-            if let (Some((bind, _)), Some(buf)) = (&self.icon_atlas, &icon_buf) {
-                pass.set_pipeline(&self.icon_pipeline);
+            if canvas_visible {
+                pass.set_scissor_rect(sx, sy, sgw, sgh);
                 pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_bind_group(1, bind, &[]);
-                pass.set_vertex_buffer(0, buf.slice(..));
-                pass.draw(0..icon_verts.len() as u32, 0..1);
-            }
-            if !lines.is_empty() {
-                pass.set_pipeline(&self.line_pipeline);
-                pass.set_vertex_buffer(0, line_buf.slice(..));
-                pass.draw(0..lines.len() as u32, 0..1);
-            }
-            // Screen-space UI (toolbar) on top, using the UI bind group.
-            if !ui_tris.is_empty() {
-                pass.set_pipeline(&self.tri_pipeline);
-                pass.set_bind_group(0, &self.ui_bind_group, &[]);
-                pass.set_vertex_buffer(0, ui_buf.slice(..));
-                pass.draw(0..ui_tris.len() as u32, 0..1);
+                if !tris.is_empty() {
+                    pass.set_pipeline(&self.tri_pipeline);
+                    pass.set_vertex_buffer(0, tri_buf.slice(..));
+                    pass.draw(0..tris.len() as u32, 0..1);
+                }
+                // Module icons, on top of node bodies (camera-space, nearest-sampled atlas).
+                if let (Some((bind, _)), Some(buf)) = (&self.icon_atlas, &icon_buf) {
+                    pass.set_pipeline(&self.icon_pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.set_bind_group(1, bind, &[]);
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw(0..icon_verts.len() as u32, 0..1);
+                }
+                if !lines.is_empty() {
+                    pass.set_pipeline(&self.line_pipeline);
+                    pass.set_vertex_buffer(0, line_buf.slice(..));
+                    pass.draw(0..lines.len() as u32, 0..1);
+                }
             }
         }
-        self.queue.submit(Some(encoder.finish()));
+
+        // Pass 2 — egui chrome (load, full surface) over the canvas.
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+                .forget_lifetime();
+            self.egui_renderer
+                .render(&mut pass, &egui.paint_jobs, &screen_desc);
+        }
+
+        self.queue
+            .submit(egui_cmds.into_iter().chain(std::iter::once(encoder.finish())));
         frame.present();
+
+        for id in &egui.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
     }
 }
 
 const SHADER: &str = r#"
-// Scalar padding (not vec3) so the struct stays 32 bytes, matching the Rust `Uniform`.
-// A `vec3<f32>` would force 16-byte alignment and a 48-byte struct.
 struct U {
-    viewport: vec2<f32>,
+    surface: vec2<f32>,
+    canvas_origin: vec2<f32>,
+    canvas_size: vec2<f32>,
     pan: vec2<f32>,
     zoom: f32,
     pad0: f32,
@@ -759,12 +708,15 @@ struct VOut {
     @location(0) color: vec4<f32>,
 };
 
+fn world_to_ndc(p: vec2<f32>) -> vec2<f32> {
+    let screen = u.canvas_origin + u.canvas_size * 0.5 + (p - u.pan) * u.zoom;
+    return vec2<f32>(screen.x / u.surface.x * 2.0 - 1.0, 1.0 - screen.y / u.surface.y * 2.0);
+}
+
 @vertex
 fn vs(@location(0) p: vec2<f32>, @location(1) c: vec4<f32>) -> VOut {
-    let screen = (p - u.pan) * u.zoom + u.viewport * 0.5;
-    let ndc = vec2<f32>(screen.x / u.viewport.x * 2.0 - 1.0, 1.0 - screen.y / u.viewport.y * 2.0);
     var o: VOut;
-    o.pos = vec4<f32>(ndc, 0.0, 1.0);
+    o.pos = vec4<f32>(world_to_ndc(p), 0.0, 1.0);
     o.color = c;
     return o;
 }
@@ -777,7 +729,9 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
 
 const ICON_SHADER: &str = r#"
 struct U {
-    viewport: vec2<f32>,
+    surface: vec2<f32>,
+    canvas_origin: vec2<f32>,
+    canvas_size: vec2<f32>,
     pan: vec2<f32>,
     zoom: f32,
     pad0: f32,
@@ -795,8 +749,8 @@ struct VOut {
 
 @vertex
 fn vs(@location(0) p: vec2<f32>, @location(1) uv: vec2<f32>) -> VOut {
-    let screen = (p - u.pan) * u.zoom + u.viewport * 0.5;
-    let ndc = vec2<f32>(screen.x / u.viewport.x * 2.0 - 1.0, 1.0 - screen.y / u.viewport.y * 2.0);
+    let screen = u.canvas_origin + u.canvas_size * 0.5 + (p - u.pan) * u.zoom;
+    let ndc = vec2<f32>(screen.x / u.surface.x * 2.0 - 1.0, 1.0 - screen.y / u.surface.y * 2.0);
     var o: VOut;
     o.pos = vec4<f32>(ndc, 0.0, 1.0);
     o.uv = uv;
