@@ -69,6 +69,14 @@ pub struct ChromeInputs<'a> {
 pub struct CanvasInput {
     /// Pointer position while hovering or dragging the canvas, if any.
     pub pointer: Option<[f32; 2]>,
+    /// Where the primary button went down (egui points), if currently pressed. Used to decide a
+    /// drag's target at the press position rather than after egui's drag threshold has moved the
+    /// pointer off a small marker.
+    pub press_origin: Option<[f32; 2]>,
+    /// The exact pointer position (egui points) on the frame the button was released — set only on
+    /// that frame. Used to resolve a wire-drag's drop target at the precise release point, mirroring
+    /// `press_origin` on the press side.
+    pub release_pos: Option<[f32; 2]>,
     pub drag_started: bool,
     pub dragging: bool,
     pub drag_stopped: bool,
@@ -372,6 +380,12 @@ impl TilesBehavior<'_> {
         egui::Frame::none()
             .inner_margin(egui::Margin::symmetric(inset, 0.0))
             .show(ui, |ui| {
+                // Palette text is never selectable: a selectable `Label` installs its own
+                // text-selection interaction that steals a press-drag begun on the glyphs, so the
+                // row's drag-source only fired when you happened to grab the icon or padding.
+                // Disabling it here lets the drag-source own the whole row. (Propagates to the
+                // child Uis built below — scroll area, rows.)
+                ui.style_mut().interaction.selectable_labels = false;
                 ui.add_space(2.0);
                 ui.label("Drag a module onto the canvas:");
                 ui.separator();
@@ -409,8 +423,18 @@ impl TilesBehavior<'_> {
             0.0
         };
         let d = resp.drag_delta();
+        let press_origin = ui
+            .input(|i| i.pointer.press_origin())
+            .map(|p| [p.x, p.y]);
+        let release_pos = if resp.drag_stopped() {
+            ui.input(|i| i.pointer.latest_pos()).map(|p| [p.x, p.y])
+        } else {
+            None
+        };
         self.canvas_input = CanvasInput {
             pointer,
+            press_origin,
+            release_pos,
             drag_started: resp.drag_started(),
             dragging: resp.dragged(),
             drag_stopped: resp.drag_stopped(),

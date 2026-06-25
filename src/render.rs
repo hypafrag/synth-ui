@@ -75,8 +75,6 @@ const WIRE_PENDING: [f32; 4] = [0.96, 0.86, 0.28, 1.0];
 // Hover highlights for ports and wires.
 const PORT_HOVER: [f32; 4] = [0.98, 0.98, 0.92, 1.0];
 const WIRE_HOVER: [f32; 4] = [0.98, 0.92, 0.45, 1.0];
-/// Hovered ports render this much larger than `PORT_R_MM`.
-const PORT_HOVER_SCALE: f32 = 1.7;
 
 // Icon quad size and inset from the node's top-left corner, in mm.
 const ICON_MM: f32 = 4.2;
@@ -137,17 +135,15 @@ pub fn build_scene(
         push_rect(&mut tris, r.x, r.y, r.w, HEADER_H_MM, header);
         for p in g.inputs.iter().chain(g.outputs.iter()) {
             let hovered = hover.port == Some((g.id.as_str(), p.name.as_str(), p.is_output));
-            let (rad, color) = if hovered {
-                (PORT_R_MM * PORT_HOVER_SCALE, PORT_HOVER)
-            } else {
-                (PORT_R_MM, PORT)
-            };
+            // Hover only recolors the marker — its size never changes (so the hit target matches
+            // exactly what is drawn).
+            let color = if hovered { PORT_HOVER } else { PORT };
             push_rect(
                 &mut tris,
-                p.pos[0] - rad,
-                p.pos[1] - rad,
-                rad * 2.0,
-                rad * 2.0,
+                p.pos[0] - PORT_R_MM,
+                p.pos[1] - PORT_R_MM,
+                PORT_R_MM * 2.0,
+                PORT_R_MM * 2.0,
                 color,
             );
         }

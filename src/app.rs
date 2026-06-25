@@ -155,13 +155,21 @@ impl App {
         self.canvas_world = world;
 
         if ci.drag_started {
-            if let Some(port) = self.view.hit_port(world) {
+            // Hit-test at the press origin (where the button went down), not at `world`: egui
+            // reports `drag_started` only after the pointer passes its drag threshold, so `world`
+            // has already nudged off a small port marker. The press origin is exactly where the
+            // user aimed, so a press that began on a port reliably starts a wire.
+            let grab = ci
+                .press_origin
+                .map(|p| self.camera.screen_to_world([p[0] * ppp, p[1] * ppp], self.canvas_rect))
+                .unwrap_or(world);
+            if let Some(port) = self.view.hit_port(grab) {
                 self.drag = Drag::Wire { src: port };
-            } else if let Some(id) = self.view.hit_node(world) {
-                let center = self.node_center(&id).unwrap_or(world);
+            } else if let Some(id) = self.view.hit_node(grab) {
+                let center = self.node_center(&id).unwrap_or(grab);
                 self.drag = Drag::Node {
                     id,
-                    offset: [world[0] - center[0], world[1] - center[1]],
+                    offset: [grab[0] - center[0], grab[1] - center[1]],
                 };
             } else {
                 self.drag = Drag::Pan;
@@ -182,7 +190,13 @@ impl App {
 
         if ci.drag_stopped {
             if let Drag::Wire { src } = self.drag.clone() {
-                if let Some(target) = self.view.hit_port(world) {
+                // Resolve the drop at the exact release position, mirroring the press side — not at
+                // a possibly-stale `world`.
+                let drop = ci
+                    .release_pos
+                    .map(|p| self.camera.screen_to_world([p[0] * ppp, p[1] * ppp], self.canvas_rect))
+                    .unwrap_or(world);
+                if let Some(target) = self.view.hit_port(drop) {
                     if self.view.try_connect(&src, &target) {
                         self.audio
                             .rebuild_if_playing(&self.view.patch, &self.view.registry);
@@ -193,11 +207,19 @@ impl App {
         }
 
         if ci.secondary_clicked {
-            if let Some(port) = self.view.hit_port(world) {
-                if self.view.disconnect_port(&port) {
-                    self.audio
-                        .rebuild_if_playing(&self.view.patch, &self.view.registry);
-                }
+            // Right-click on a wired input inlet removes that one connection, named by its
+            // endpoints (which output feeds it) — never a positional inlet index. Right-click on an
+            // output removes all its fan-out.
+            let changed = if let Some((from, to)) = self.view.wire_at_input(world) {
+                self.view.disconnect_wire(&from, &to)
+            } else if let Some(port) = self.view.hit_port(world) {
+                port.is_output && self.view.disconnect_output(&port.node, &port.port)
+            } else {
+                false
+            };
+            if changed {
+                self.audio
+                    .rebuild_if_playing(&self.view.patch, &self.view.registry);
             }
         }
 
@@ -206,20 +228,30 @@ impl App {
             self.camera.zoom_at(phys, self.canvas_rect, factor);
         }
 
-        // Hover only when idle. Prefer the most specific target: a port, then a wire (1 mm band),
-        // then the node body.
-        self.hover = if matches!(self.drag, Drag::None) {
-            if let Some(port) = self.view.hit_port(world) {
-                Hover::Port(port)
-            } else if let Some(wire) = self.view.hit_wire(world, WIRE_HIT_HALF_MM / self.camera.zoom) {
-                Hover::Wire(wire)
-            } else if let Some(id) = self.view.hit_node(world) {
-                Hover::Node(id)
-            } else {
-                Hover::None
+        self.hover = match &self.drag {
+            // Idle: prefer the most specific target — a port, then a wire (1 mm band), then the
+            // node body.
+            Drag::None => {
+                if let Some(port) = self.view.hit_port(world) {
+                    Hover::Port(port)
+                } else if let Some(wire) =
+                    self.view.hit_wire(world, WIRE_HIT_HALF_MM / self.camera.zoom)
+                {
+                    Hover::Wire(wire)
+                } else if let Some(id) = self.view.hit_node(world) {
+                    Hover::Node(id)
+                } else {
+                    Hover::None
+                }
             }
-        } else {
-            Hover::None
+            // Dragging a wire: highlight a compatible drop target under the cursor — a port of the
+            // opposite direction on a different node (the same rule `try_connect` accepts), so
+            // outputs light up inputs and inputs light up outputs.
+            Drag::Wire { src } => match self.view.hit_port(world) {
+                Some(p) if p.is_output != src.is_output && p.node != src.node => Hover::Port(p),
+                _ => Hover::None,
+            },
+            _ => Hover::None,
         };
     }
 
@@ -409,7 +441,8 @@ impl App {
             Drag::Wire { src } => Some((src.pos, world)),
             _ => None,
         };
-        // `self.hover` is already cleared while dragging, so it maps straight to the scene highlight.
+        // `self.hover` maps straight to the scene highlight: idle hover, or — while dragging a wire
+        // — the compatible drop-target port under the cursor.
         let hover = match &self.hover {
             Hover::None => SceneHover::default(),
             Hover::Node(id) => SceneHover {
