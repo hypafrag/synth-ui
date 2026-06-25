@@ -13,6 +13,14 @@
 pub const MIN_ZOOM: f32 = 0.15;
 pub const MAX_ZOOM: f32 = 5.0;
 
+/// Screen-space offset (physical px) applied to a cursor point before mapping it to world space.
+/// The GPU rasterizes geometry by sampling at pixel **centers**, so a thin feature (a 1 px wire)
+/// appears about half a pixel down-right of its mathematical position; nudging the incoming screen
+/// coordinate by the same amount makes hit-testing land where the geometry is actually drawn. This
+/// stays on the input side, leaving the renderer a pure projection. See
+/// `docs/architecture/12-ui-rendering.md`.
+const CURSOR_SS_OFFSET: [f32; 2] = [2.0, 2.0];
+
 /// Logical pixels per millimeter at scale factor 1.0, using the conventional 96 px/inch reference
 /// (the same approximation CSS's `px` uses). Best-effort: exact when the OS's logical pixels track
 /// real size.
@@ -50,9 +58,10 @@ impl Camera {
         let e = self.px_per_mm();
         let cx = rect[0] + rect[2] * 0.5;
         let cy = rect[1] + rect[3] * 0.5;
+        // Offset the screen point before conversion (see `CURSOR_SS_OFFSET`).
         [
-            (screen[0] - cx) / e + self.pan[0],
-            (screen[1] - cy) / e + self.pan[1],
+            (screen[0] - CURSOR_SS_OFFSET[0] - cx) / e + self.pan[0],
+            (screen[1] - CURSOR_SS_OFFSET[1] - cy) / e + self.pan[1],
         ]
     }
 

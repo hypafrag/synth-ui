@@ -32,6 +32,10 @@ enum Pane {
     Palette,
 }
 
+/// Generic dark "window" background for docked panels, so they read as chrome rather than letting
+/// the wgpu canvas show through. Hardcoded (not a platform color) and distinct from the canvas.
+const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(32, 34, 38);
+
 /// The egui drag payload carried from a palette row to the canvas: the module type id.
 #[derive(Clone)]
 struct ModulePayload(String);
@@ -53,7 +57,8 @@ pub struct ChromeInputs<'a> {
     pub registry: &'a Registry,
     pub audio_playing: bool,
     pub audio_status: &'a str,
-    pub hover: Option<(String, String)>,
+    /// Pre-formatted description of the hovered canvas item, shown in the status bar.
+    pub hover: Option<String>,
     pub node_count: usize,
 }
 
@@ -120,7 +125,7 @@ impl Chrome {
                         actions.push(ChromeAction::New);
                         ui.close_menu();
                     }
-                    if ui.button("Open Patch…").clicked() {
+                    if ui.button("Open Patch...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("patch", &["yml", "yaml"])
                             .pick_file()
@@ -129,7 +134,7 @@ impl Chrome {
                         }
                         ui.close_menu();
                     }
-                    if ui.button("Save Patch As…").clicked() {
+                    if ui.button("Save Patch As...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("patch", &["yml", "yaml"])
                             .set_file_name("patch.yml")
@@ -168,7 +173,7 @@ impl Chrome {
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let play = if inp.audio_playing { "⏸  Stop" } else { "▶  Play" };
+                let play = if inp.audio_playing { "Stop" } else { "Play" };
                 if ui.button(play).clicked() {
                     actions.push(ChromeAction::ToggleAudio);
                 }
@@ -181,7 +186,7 @@ impl Chrome {
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let state = if inp.audio_playing { "playing" } else { "stopped" };
-                ui.label(format!("● {state}"));
+                ui.label(state);
                 let extra = inp.audio_status;
                 if !extra.is_empty() && extra != "playing" && extra != "stopped" {
                     ui.separator();
@@ -189,9 +194,9 @@ impl Chrome {
                 }
                 ui.separator();
                 ui.label(format!("{} nodes", inp.node_count));
-                if let Some((id, ty)) = &inp.hover {
+                if let Some(detail) = &inp.hover {
                     ui.separator();
-                    ui.label(format!("{id} ({ty})"));
+                    ui.label(detail);
                 }
             });
         });
@@ -362,25 +367,31 @@ impl TilesBehavior<'_> {
     }
 
     fn palette_ui(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(2.0);
-        ui.label("Drag a module onto the canvas:");
-        ui.separator();
-        let types = self.palette_types;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for ty in types {
-                let tex = self.icon_tex(ui, ty);
-                let id = egui::Id::new(("palette-row", ty.as_str()));
-                ui.dnd_drag_source(id, ModulePayload(ty.clone()), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                            tex,
-                            egui::vec2(18.0, 18.0),
-                        )));
-                        ui.label(ty.as_str());
-                    });
+        // 3 mm side insets (UI dims are authored in millimeters; mm → egui points via 96/25.4).
+        let inset = 2.0 * crate::camera::LOGICAL_PX_PER_MM;
+        egui::Frame::none()
+            .inner_margin(egui::Margin::symmetric(inset, 0.0))
+            .show(ui, |ui| {
+                ui.add_space(2.0);
+                ui.label("Drag a module onto the canvas:");
+                ui.separator();
+                let types = self.palette_types;
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for ty in types {
+                        let tex = self.icon_tex(ui, ty);
+                        let id = egui::Id::new(("palette-row", ty.as_str()));
+                        ui.dnd_drag_source(id, ModulePayload(ty.clone()), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                                    tex,
+                                    egui::vec2(18.0, 18.0),
+                                )));
+                                ui.label(ty.as_str());
+                            });
+                        });
+                    }
                 });
-            }
-        });
+            });
     }
 
     /// Render the canvas tile: claim its rect, read pointer interaction, draw nothing (transparent).
@@ -413,11 +424,20 @@ impl TilesBehavior<'_> {
 impl Behavior<Pane> for TilesBehavior<'_> {
     fn pane_ui(&mut self, ui: &mut egui::Ui, _tile_id: TileId, pane: &mut Pane) -> UiResponse {
         match pane {
+            // Canvas stays transparent so the wgpu canvas shows through.
             Pane::Canvas => self.canvas_ui(ui),
-            Pane::Palette => self.palette_ui(ui),
+            Pane::Palette => {
+                ui.painter().rect_filled(ui.max_rect(), 0.0, PANEL_BG);
+                self.palette_ui(ui);
+            }
         }
         // Neither pane is draggable by its body; panels are dragged via their tab.
         UiResponse::None
+    }
+
+    /// Match the tab bar to the panel body color (dark window chrome).
+    fn tab_bar_color(&self, _visuals: &egui::Visuals) -> egui::Color32 {
+        PANEL_BG
     }
 
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {

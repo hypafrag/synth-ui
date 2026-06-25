@@ -19,7 +19,7 @@ use winit::window::Window;
 use synth_core::module::{Icon, SignalKind};
 
 use crate::camera::Camera;
-use crate::graph::{HEADER_H_MM, NodeGeom, PORT_R_MM};
+use crate::graph::{HEADER_H_MM, NodeGeom, PORT_R_MM, WireSeg};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -73,6 +73,11 @@ const PORT_SAMPLE: [f32; 4] = [0.32, 0.78, 0.66, 1.0];
 const PORT_EVENT: [f32; 4] = [0.92, 0.58, 0.22, 1.0];
 const WIRE: [f32; 4] = [0.74, 0.78, 0.83, 1.0];
 const WIRE_PENDING: [f32; 4] = [0.96, 0.86, 0.28, 1.0];
+// Hover highlights for ports and wires.
+const PORT_HOVER: [f32; 4] = [0.98, 0.98, 0.92, 1.0];
+const WIRE_HOVER: [f32; 4] = [0.98, 0.92, 0.45, 1.0];
+/// Hovered ports render this much larger than `PORT_R_MM`.
+const PORT_HOVER_SCALE: f32 = 1.7;
 
 // Icon quad size and inset from the node's top-left corner, in mm.
 const ICON_MM: f32 = 4.2;
@@ -107,11 +112,22 @@ fn push_line(v: &mut Vec<Vertex>, a: [f32; 2], b: [f32; 2], color: [f32; 4]) {
 }
 
 /// Build triangle and line vertices for the current scene.
+/// What the cursor is hovering, for highlighting. Empty fields mean nothing hovered of that kind.
+#[derive(Default, Clone, Copy)]
+pub struct SceneHover<'a> {
+    /// Hovered node id (highlights its header).
+    pub node: Option<&'a str>,
+    /// Hovered port as `(node_id, port_name, is_output)`.
+    pub port: Option<(&'a str, &'a str, bool)>,
+    /// Hovered wire as its `patch.wires` index (matches [`WireSeg::index`]).
+    pub wire: Option<usize>,
+}
+
 pub fn build_scene(
     geoms: &[NodeGeom],
-    wires: &[([f32; 2], [f32; 2], SignalKind)],
+    wires: &[WireSeg],
     pending: Option<([f32; 2], [f32; 2])>,
-    hover: Option<&str>,
+    hover: SceneHover,
 ) -> (Vec<Vertex>, Vec<Vertex>) {
     let mut tris = Vec::new();
     let mut lines = Vec::new();
@@ -121,26 +137,37 @@ pub fn build_scene(
         push_rect(&mut tris, r.x, r.y, r.w, r.h, NODE_BODY);
         let header = if !g.known {
             NODE_UNKNOWN
-        } else if hover == Some(g.id.as_str()) {
+        } else if hover.node == Some(g.id.as_str()) {
             NODE_HEADER_HOVER
         } else {
             NODE_HEADER
         };
         push_rect(&mut tris, r.x, r.y, r.w, HEADER_H_MM, header);
         for p in g.inputs.iter().chain(g.outputs.iter()) {
+            let hovered = hover.port == Some((g.id.as_str(), p.name.as_str(), p.is_output));
+            let (rad, color) = if hovered {
+                (PORT_R_MM * PORT_HOVER_SCALE, PORT_HOVER)
+            } else {
+                (PORT_R_MM, port_color(p.kind))
+            };
             push_rect(
                 &mut tris,
-                p.pos[0] - PORT_R_MM,
-                p.pos[1] - PORT_R_MM,
-                PORT_R_MM * 2.0,
-                PORT_R_MM * 2.0,
-                port_color(p.kind),
+                p.pos[0] - rad,
+                p.pos[1] - rad,
+                rad * 2.0,
+                rad * 2.0,
+                color,
             );
         }
     }
 
-    for (a, b, kind) in wires {
-        push_line(&mut lines, *a, *b, port_color(*kind));
+    for w in wires {
+        let color = if hover.wire == Some(w.index) {
+            WIRE_HOVER
+        } else {
+            port_color(w.kind)
+        };
+        push_line(&mut lines, w.a, w.b, color);
     }
     let _ = WIRE; // reserved neutral wire color
     if let Some((a, b)) = pending {

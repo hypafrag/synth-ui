@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use synth_core::model::Patch;
-use synth_core::module::Icon;
+use synth_core::module::{Icon, SignalKind};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
@@ -30,7 +30,7 @@ use crate::camera::{self, Camera};
 use crate::chrome::{CanvasInput, Chrome, ChromeAction, ChromeInputs};
 use crate::graph::{GraphView, PortRef};
 use crate::layout;
-use crate::render::{self, EguiFrame, Renderer, build_scene};
+use crate::render::{self, EguiFrame, Renderer, SceneHover, build_scene};
 
 #[derive(Clone, Default)]
 enum Drag {
@@ -47,6 +47,29 @@ enum Drag {
     },
 }
 
+/// What the cursor is currently hovering on the canvas (when idle).
+#[derive(Clone, Default)]
+enum Hover {
+    #[default]
+    None,
+    Node(String),
+    Port(PortRef),
+    /// Index into `patch.wires`.
+    Wire(usize),
+}
+
+fn kind_name(kind: SignalKind) -> &'static str {
+    match kind {
+        SignalKind::Sample => "Sample",
+        SignalKind::Event => "Event",
+    }
+}
+
+/// Half-width of a wire's hover hit band, in **screen** millimeters (the band is 3 mm wide on
+/// screen, constant regardless of zoom). Converted to a world tolerance via the camera zoom: at
+/// zoom `z`, one world mm renders as `z` screen mm, so the world tolerance is this divided by `z`.
+const WIRE_HIT_HALF_MM: f32 = 1.5;
+
 pub struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -54,7 +77,7 @@ pub struct App {
     camera: Camera,
     audio: Audio,
     drag: Drag,
-    hover_id: Option<String>,
+    hover: Hover,
     /// Last canvas pointer position in world mm (for drawing the pending wire).
     canvas_world: [f32; 2],
     /// Module icon atlas: the distinct icons and a `type_id → atlas index` map.
@@ -89,7 +112,7 @@ impl App {
             camera: Camera::default(),
             audio: Audio::default(),
             drag: Drag::None,
-            hover_id: None,
+            hover: Hover::None,
             canvas_world: [0.0, 0.0],
             icon_list,
             icon_index,
@@ -130,7 +153,7 @@ impl App {
         let Some(p_pts) = ci.pointer else {
             // Pointer not over the canvas (and not mid-drag): drop any hover highlight.
             if matches!(self.drag, Drag::None) {
-                self.hover_id = None;
+                self.hover = Hover::None;
             }
             return;
         };
@@ -190,13 +213,60 @@ impl App {
             self.camera.zoom_at(phys, self.canvas_rect, factor);
         }
 
-        // Hover highlight only when not dragging.
-        let hit = if matches!(self.drag, Drag::None) {
-            self.view.hit_node(world)
+        // Hover only when idle. Prefer the most specific target: a port, then a wire (1 mm band),
+        // then the node body.
+        self.hover = if matches!(self.drag, Drag::None) {
+            if let Some(port) = self.view.hit_port(world) {
+                Hover::Port(port)
+            } else if let Some(wire) = self.view.hit_wire(world, WIRE_HIT_HALF_MM / self.camera.zoom) {
+                Hover::Wire(wire)
+            } else if let Some(id) = self.view.hit_node(world) {
+                Hover::Node(id)
+            } else {
+                Hover::None
+            }
         } else {
-            None
+            Hover::None
         };
-        self.hover_id = hit;
+    }
+
+    /// A human-readable description of the currently hovered item, for the status bar. `wires` is the
+    /// resolved wire list (for the hovered wire's signal kind).
+    fn hover_detail(&self, wires: &[crate::graph::WireSeg]) -> Option<String> {
+        match &self.hover {
+            Hover::None => None,
+            Hover::Node(id) => self
+                .view
+                .patch
+                .nodes
+                .iter()
+                .find(|n| &n.id == id)
+                .map(|n| format!("node  {}  ({})", n.id, n.ty)),
+            Hover::Port(p) => {
+                let dir = if p.is_output { "output" } else { "input" };
+                Some(format!(
+                    "{dir}  {}.{}  ({})",
+                    p.node,
+                    p.port,
+                    kind_name(p.kind)
+                ))
+            }
+            Hover::Wire(idx) => {
+                let w = self.view.patch.wires.get(*idx)?;
+                let kind = wires
+                    .iter()
+                    .find(|s| s.index == *idx)
+                    .map(|s| kind_name(s.kind))
+                    .unwrap_or("");
+                Some(format!(
+                    "wire  {}.{} -> {}.{}  ({kind})",
+                    w.from.node(),
+                    w.from.port(),
+                    w.to.node(),
+                    w.to.port()
+                ))
+            }
+        }
     }
 
     fn on_key(&mut self, event: KeyEvent) {
@@ -241,7 +311,7 @@ impl App {
             }
             ChromeAction::New => {
                 self.view = GraphView::new(empty_patch());
-                self.hover_id = None;
+                self.hover = Hover::None;
                 self.audio.stop();
                 true
             }
@@ -256,7 +326,7 @@ impl App {
                             layout::autolayout_full(&mut view);
                         }
                         self.view = view;
-                        self.hover_id = None;
+                        self.hover = Hover::None;
                         self.audio
                             .rebuild_if_playing(&self.view.patch, &self.view.registry);
                         true
@@ -297,6 +367,11 @@ impl App {
 
         let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(&window);
 
+        // Status-bar detail for the hovered item (from last frame's hover).
+        let pre_geoms = self.view.geoms();
+        let pre_wires = self.view.wire_segments(&pre_geoms);
+        let hover_detail = self.hover_detail(&pre_wires);
+
         // Run egui, building the chrome. A cloned context avoids borrowing `self.egui_ctx` while the
         // closure mutably borrows `self.chrome` and reads other disjoint fields.
         let ctx = self.egui_ctx.clone();
@@ -304,14 +379,7 @@ impl App {
             registry: &self.view.registry,
             audio_playing: self.audio.playing,
             audio_status: &self.audio.status,
-            hover: self.hover_id.as_ref().and_then(|id| {
-                self.view
-                    .patch
-                    .nodes
-                    .iter()
-                    .find(|n| &n.id == id)
-                    .map(|n| (n.id.clone(), n.ty.clone()))
-            }),
+            hover: hover_detail,
             node_count: self.view.patch.nodes.len(),
         };
         let mut chrome_out = None;
@@ -342,6 +410,7 @@ impl App {
 
         // Canvas pointer interaction, then chrome actions; rebuild the icon atlas if types changed.
         self.process_canvas_input(&chrome_out.canvas_input, ppp);
+
         let mut needs_atlas = false;
         for action in chrome_out.actions {
             needs_atlas |= self.apply_action(el, action, ppp);
@@ -360,9 +429,21 @@ impl App {
             Drag::Wire { src } => Some((src.pos, world)),
             _ => None,
         };
-        let hover = match self.drag {
-            Drag::None => self.hover_id.as_deref(),
-            _ => None,
+        // `self.hover` is already cleared while dragging, so it maps straight to the scene highlight.
+        let hover = match &self.hover {
+            Hover::None => SceneHover::default(),
+            Hover::Node(id) => SceneHover {
+                node: Some(id.as_str()),
+                ..Default::default()
+            },
+            Hover::Port(p) => SceneHover {
+                port: Some((p.node.as_str(), p.port.as_str(), p.is_output)),
+                ..Default::default()
+            },
+            Hover::Wire(i) => SceneHover {
+                wire: Some(*i),
+                ..Default::default()
+            },
         };
         let (tris, lines) = build_scene(&geoms, &wires, pending, hover);
         let icons = render::build_icons(&geoms, &self.icon_index, self.icon_list.len());

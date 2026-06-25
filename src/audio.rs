@@ -7,12 +7,26 @@
 use std::any::Any;
 
 use synth_core::audio::run_default_output;
-use synth_core::model::Patch;
+use synth_core::model::{ParamValue, Patch};
 use synth_core::module::Registry;
 use synth_core::plan_engine::PlanEngine;
 
 /// Maximum audio block size (frames) the engine pre-allocates for.
 const MAX_FRAMES: usize = 16384;
+
+/// Apply host-level overrides before building the engine. The UI gates audio with its play/stop
+/// button, so it forces every `ansi_keyboard` source into always-on mode (`toggle: false`) — the
+/// backtick on/off toggle is a CLI-only affordance. Returns a modified clone; the edited/saved
+/// patch stays host-neutral.
+fn ui_patch(patch: &Patch) -> Patch {
+    let mut patch = patch.clone();
+    for node in &mut patch.nodes {
+        if node.ty == "ansi_keyboard" {
+            node.params.insert("toggle".to_string(), ParamValue::Bool(false));
+        }
+    }
+    patch
+}
 
 #[derive(Default)]
 pub struct Audio {
@@ -32,7 +46,8 @@ impl Audio {
 
     pub fn start(&mut self, patch: &Patch, registry: &Registry) {
         self.stream = None; // release any prior device stream before opening a new one
-        match PlanEngine::build(patch, registry, MAX_FRAMES) {
+        let patch = ui_patch(patch);
+        match PlanEngine::build(&patch, registry, MAX_FRAMES) {
             Ok(engine) => match run_default_output(engine) {
                 Ok(stream) => {
                     self.stream = Some(Box::new(stream));

@@ -76,6 +76,30 @@ pub struct PortRef {
     pub pos: [f32; 2],
 }
 
+/// A wire resolved to its drawn endpoints, tagged with its index in `patch.wires` so rendering and
+/// hit-testing can identify the same wire.
+#[derive(Clone, Copy)]
+pub struct WireSeg {
+    pub index: usize,
+    pub a: [f32; 2],
+    pub b: [f32; 2],
+    pub kind: SignalKind,
+}
+
+/// Distance from point `p` to the segment `a`–`b`, all in world mm.
+fn dist_point_segment(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let (abx, aby) = (b[0] - a[0], b[1] - a[1]);
+    let (apx, apy) = (p[0] - a[0], p[1] - a[1]);
+    let len2 = abx * abx + aby * aby;
+    let t = if len2 > 0.0 {
+        ((apx * abx + apy * aby) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (cx, cy) = (a[0] + t * abx, a[1] + t * aby);
+    ((p[0] - cx).powi(2) + (p[1] - cy).powi(2)).sqrt()
+}
+
 pub struct GraphView {
     pub patch: Patch,
     pub registry: Registry,
@@ -298,22 +322,44 @@ impl GraphView {
         self.patch.wires.len() != before
     }
 
-    /// Resolve each wire to its `(from_pos, to_pos, kind)` world endpoints for drawing.
-    pub fn wire_segments(&self, geoms: &[NodeGeom]) -> Vec<([f32; 2], [f32; 2], SignalKind)> {
+    /// Resolve each wire to its drawn endpoints (tagged with its `patch.wires` index). Wires whose
+    /// endpoints can't be resolved (missing node/port) are skipped.
+    pub fn wire_segments(&self, geoms: &[NodeGeom]) -> Vec<WireSeg> {
         let by_id: HashMap<&str, &NodeGeom> = geoms.iter().map(|g| (g.id.as_str(), g)).collect();
         let mut segs = Vec::new();
-        for w in &self.patch.wires {
+        for (index, w) in self.patch.wires.iter().enumerate() {
             let from = by_id.get(w.from.node());
             let to = by_id.get(w.to.node());
             if let (Some(fg), Some(tg)) = (from, to) {
                 let fp = fg.outputs.iter().find(|p| p.name == w.from.port());
                 let tp = tg.inputs.iter().find(|p| p.name == w.to.port());
                 if let (Some(fp), Some(tp)) = (fp, tp) {
-                    segs.push((fp.pos, tp.pos, fp.kind));
+                    segs.push(WireSeg {
+                        index,
+                        a: fp.pos,
+                        b: tp.pos,
+                        kind: fp.kind,
+                    });
                 }
             }
         }
         segs
+    }
+
+    /// The `patch.wires` index of the wire whose drawn segment is closest to `world`, within
+    /// `max_dist` (world mm). `None` if no wire is close enough. `max_dist` is a **world** tolerance;
+    /// the caller derives it from a fixed *screen* size and the camera zoom so the hit band is a
+    /// constant width on screen regardless of zoom (see `app::WIRE_HIT_HALF_MM`).
+    pub fn hit_wire(&self, world: [f32; 2], max_dist: f32) -> Option<usize> {
+        let geoms = self.geoms();
+        let mut best: Option<(f32, usize)> = None;
+        for s in self.wire_segments(&geoms) {
+            let d = dist_point_segment(world, s.a, s.b);
+            if d <= max_dist && best.map_or(true, |(bd, _)| d < bd) {
+                best = Some((d, s.index));
+            }
+        }
+        best.map(|(_, i)| i)
     }
 }
 
@@ -339,5 +385,33 @@ mod tests {
         // Each id has a layout entry at the requested center.
         assert_eq!(view.patch.layout.get(&a), Some(&[10.0, -5.0]));
         assert_eq!(view.patch.layout.get(&b), Some(&[20.0, 5.0]));
+    }
+
+    #[test]
+    fn hit_wire_uses_1mm_band() {
+        let view = GraphView::new(
+            Patch::from_yaml(
+                "version: 1\n\
+                 nodes:\n\
+                 \x20 - { id: a, type: const_generator }\n\
+                 \x20 - { id: b, type: sine_generator }\n\
+                 wires:\n\
+                 \x20 - { from: [a, out], to: [b, frequency] }\n\
+                 layout:\n\
+                 \x20 a: [-25, 0]\n\
+                 \x20 b: [25, 0]\n",
+            )
+            .unwrap(),
+        );
+        let geoms = view.geoms();
+        let segs = view.wire_segments(&geoms);
+        assert_eq!(segs.len(), 1);
+        let s = segs[0];
+        let mid = [(s.a[0] + s.b[0]) * 0.5, (s.a[1] + s.b[1]) * 0.5];
+
+        // With a 0.5 mm world tolerance: on the wire and just inside hit; well outside misses.
+        assert_eq!(view.hit_wire(mid, 0.5), Some(0));
+        assert_eq!(view.hit_wire([mid[0], mid[1] + 0.4], 0.5), Some(0));
+        assert_eq!(view.hit_wire([mid[0], mid[1] + 5.0], 0.5), None);
     }
 }
