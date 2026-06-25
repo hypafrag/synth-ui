@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use synth_core::model::{Endpoint, Node, Patch, Wire};
 use synth_core::modules::icons;
-use synth_core::module::{Icon, Registry, SignalKind};
+use synth_core::module::{Icon, Registry};
 
 // Node geometry constants, in millimeters (the world unit; see 12-ui-rendering.md). Shared by
 // hit-testing, rendering, and autolayout so they agree. Tweak any of these to resize uniformly.
@@ -51,7 +51,6 @@ impl Rect {
 #[derive(Clone)]
 pub struct PortGeom {
     pub name: String,
-    pub kind: SignalKind,
     pub is_output: bool,
     pub pos: [f32; 2],
 }
@@ -72,7 +71,6 @@ pub struct PortRef {
     pub node: String,
     pub port: String,
     pub is_output: bool,
-    pub kind: SignalKind,
     pub pos: [f32; 2],
 }
 
@@ -83,7 +81,6 @@ pub struct WireSeg {
     pub index: usize,
     pub a: [f32; 2],
     pub b: [f32; 2],
-    pub kind: SignalKind,
 }
 
 /// Distance from point `p` to the segment `a`–`b`, all in world mm.
@@ -113,10 +110,10 @@ impl GraphView {
         }
     }
 
-    /// The ports of a node, as `(name, kind)` for inputs and outputs. Mirrors the engine's
-    /// resolution: `audio_output` is the special sink (`ch0..chN`), everything else comes from the
-    /// registry descriptor; an unknown type has no ports.
-    fn node_ports(&self, node: &Node) -> (Vec<(String, SignalKind)>, Vec<(String, SignalKind)>, bool) {
+    /// The port names of a node, as `(inputs, outputs, known)`. Mirrors the engine's resolution:
+    /// `audio_output` is the special sink (`ch0..chN`), everything else comes from the registry
+    /// descriptor; an unknown type has no ports.
+    fn node_ports(&self, node: &Node) -> (Vec<String>, Vec<String>, bool) {
         if node.ty == "audio_output" {
             let channels = node
                 .params
@@ -124,9 +121,7 @@ impl GraphView {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(2)
                 .max(1) as usize;
-            let inputs = (0..channels)
-                .map(|c| (format!("ch{c}"), SignalKind::Sample))
-                .collect();
+            let inputs = (0..channels).map(|c| format!("ch{c}")).collect();
             return (inputs, Vec::new(), true);
         }
         let desc = if let Some(src) = self.registry.source(&node.ty) {
@@ -136,8 +131,8 @@ impl GraphView {
         } else {
             return (Vec::new(), Vec::new(), false);
         };
-        let inputs = desc.inputs.iter().map(|p| (p.name.clone(), p.kind)).collect();
-        let outputs = desc.outputs.iter().map(|p| (p.name.clone(), p.kind)).collect();
+        let inputs = desc.inputs.iter().map(|p| p.name.clone()).collect();
+        let outputs = desc.outputs.iter().map(|p| p.name.clone()).collect();
         (inputs, outputs, true)
     }
 
@@ -170,9 +165,8 @@ impl GraphView {
             let inputs = ins
                 .into_iter()
                 .enumerate()
-                .map(|(idx, (name, kind))| PortGeom {
+                .map(|(idx, name)| PortGeom {
                     name,
-                    kind,
                     is_output: false,
                     pos: [rect.x, port_y(idx)],
                 })
@@ -180,9 +174,8 @@ impl GraphView {
             let outputs = outs
                 .into_iter()
                 .enumerate()
-                .map(|(idx, (name, kind))| PortGeom {
+                .map(|(idx, name)| PortGeom {
                     name,
-                    kind,
                     is_output: true,
                     pos: [rect.x + rect.w, port_y(idx)],
                 })
@@ -243,7 +236,6 @@ impl GraphView {
                             node: g.id.clone(),
                             port: p.name.clone(),
                             is_output: p.is_output,
-                            kind: p.kind,
                             pos: p.pos,
                         },
                     ));
@@ -285,15 +277,16 @@ impl GraphView {
     }
 
     /// Try to connect two ports. Returns true if a wire was added. One must be an output and the
-    /// other an input; kinds must match; self-wires are rejected. A pre-existing wire into the
-    /// target input is replaced (one wire per input).
+    /// other an input; self-wires are rejected. A pre-existing wire into the target input is
+    /// replaced (one wire per input). All ports carry the one unified channel type, so there is no
+    /// kind to match.
     pub fn try_connect(&mut self, a: &PortRef, b: &PortRef) -> bool {
         let (out, inp) = match (a.is_output, b.is_output) {
             (true, false) => (a, b),
             (false, true) => (b, a),
             _ => return false,
         };
-        if out.kind != inp.kind || out.node == inp.node {
+        if out.node == inp.node {
             return false;
         }
         self.patch
@@ -338,7 +331,6 @@ impl GraphView {
                         index,
                         a: fp.pos,
                         b: tp.pos,
-                        kind: fp.kind,
                     });
                 }
             }

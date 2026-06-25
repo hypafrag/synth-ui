@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use synth_core::model::Patch;
-use synth_core::module::{Icon, SignalKind};
+use synth_core::module::Icon;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
@@ -56,13 +56,6 @@ enum Hover {
     Port(PortRef),
     /// Index into `patch.wires`.
     Wire(usize),
-}
-
-fn kind_name(kind: SignalKind) -> &'static str {
-    match kind {
-        SignalKind::Sample => "Sample",
-        SignalKind::Event => "Event",
-    }
 }
 
 /// Half-width of a wire's hover hit band, in **screen** millimeters (the band is 3 mm wide on
@@ -230,9 +223,8 @@ impl App {
         };
     }
 
-    /// A human-readable description of the currently hovered item, for the status bar. `wires` is the
-    /// resolved wire list (for the hovered wire's signal kind).
-    fn hover_detail(&self, wires: &[crate::graph::WireSeg]) -> Option<String> {
+    /// A human-readable description of the currently hovered item, for the status bar.
+    fn hover_detail(&self) -> Option<String> {
         match &self.hover {
             Hover::None => None,
             Hover::Node(id) => self
@@ -244,22 +236,12 @@ impl App {
                 .map(|n| format!("node  {}  ({})", n.id, n.ty)),
             Hover::Port(p) => {
                 let dir = if p.is_output { "output" } else { "input" };
-                Some(format!(
-                    "{dir}  {}.{}  ({})",
-                    p.node,
-                    p.port,
-                    kind_name(p.kind)
-                ))
+                Some(format!("{dir}  {}.{}", p.node, p.port))
             }
             Hover::Wire(idx) => {
                 let w = self.view.patch.wires.get(*idx)?;
-                let kind = wires
-                    .iter()
-                    .find(|s| s.index == *idx)
-                    .map(|s| kind_name(s.kind))
-                    .unwrap_or("");
                 Some(format!(
-                    "wire  {}.{} -> {}.{}  ({kind})",
+                    "wire  {}.{} -> {}.{}",
                     w.from.node(),
                     w.from.port(),
                     w.to.node(),
@@ -368,9 +350,7 @@ impl App {
         let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(&window);
 
         // Status-bar detail for the hovered item (from last frame's hover).
-        let pre_geoms = self.view.geoms();
-        let pre_wires = self.view.wire_segments(&pre_geoms);
-        let hover_detail = self.hover_detail(&pre_wires);
+        let hover_detail = self.hover_detail();
 
         // Run egui, building the chrome. A cloned context avoids borrowing `self.egui_ctx` while the
         // closure mutably borrows `self.chrome` and reads other disjoint fields.

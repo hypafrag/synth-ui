@@ -16,7 +16,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use synth_core::module::{Icon, SignalKind};
+use synth_core::module::Icon;
 
 use crate::camera::Camera;
 use crate::graph::{HEADER_H_MM, NodeGeom, PORT_R_MM, WireSeg};
@@ -69,9 +69,8 @@ const NODE_BODY: [f32; 4] = [0.18, 0.19, 0.22, 1.0];
 const NODE_HEADER: [f32; 4] = [0.28, 0.30, 0.37, 1.0];
 const NODE_HEADER_HOVER: [f32; 4] = [0.34, 0.52, 0.74, 1.0];
 const NODE_UNKNOWN: [f32; 4] = [0.55, 0.24, 0.26, 1.0];
-const PORT_SAMPLE: [f32; 4] = [0.32, 0.78, 0.66, 1.0];
-const PORT_EVENT: [f32; 4] = [0.92, 0.58, 0.22, 1.0];
-const WIRE: [f32; 4] = [0.74, 0.78, 0.83, 1.0];
+/// Ports and wires share one color — there is a single unified channel type, no kinds to encode.
+const PORT: [f32; 4] = [0.32, 0.78, 0.66, 1.0];
 const WIRE_PENDING: [f32; 4] = [0.96, 0.86, 0.28, 1.0];
 // Hover highlights for ports and wires.
 const PORT_HOVER: [f32; 4] = [0.98, 0.98, 0.92, 1.0];
@@ -82,13 +81,6 @@ const PORT_HOVER_SCALE: f32 = 1.7;
 // Icon quad size and inset from the node's top-left corner, in mm.
 const ICON_MM: f32 = 4.2;
 const ICON_INSET_MM: f32 = 1.0;
-
-fn port_color(kind: SignalKind) -> [f32; 4] {
-    match kind {
-        SignalKind::Sample => PORT_SAMPLE,
-        SignalKind::Event => PORT_EVENT,
-    }
-}
 
 fn push_rect(v: &mut Vec<Vertex>, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
     let (x0, y0, x1, y1) = (x, y, x + w, y + h);
@@ -148,7 +140,7 @@ pub fn build_scene(
             let (rad, color) = if hovered {
                 (PORT_R_MM * PORT_HOVER_SCALE, PORT_HOVER)
             } else {
-                (PORT_R_MM, port_color(p.kind))
+                (PORT_R_MM, PORT)
             };
             push_rect(
                 &mut tris,
@@ -165,11 +157,10 @@ pub fn build_scene(
         let color = if hover.wire == Some(w.index) {
             WIRE_HOVER
         } else {
-            port_color(w.kind)
+            PORT
         };
         push_line(&mut lines, w.a, w.b, color);
     }
-    let _ = WIRE; // reserved neutral wire color
     if let Some((a, b)) = pending {
         push_line(&mut lines, a, b, WIRE_PENDING);
     }
