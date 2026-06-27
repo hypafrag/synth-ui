@@ -9,23 +9,26 @@ use std::collections::HashMap;
 
 use synth_core::model::{Endpoint, Node, Patch, Wire};
 use synth_core::modules::icons;
-use synth_core::module::{Icon, Inputs, Registry};
+use synth_core::module::{Icon, Inputs, ParamDesc, Registry};
 
 // Node geometry constants, in millimeters (the world unit; see 12-ui-rendering.md). Shared by
 // hit-testing, rendering, and autolayout so they agree. Tweak any of these to resize uniformly.
 const NODE_W_MM: f32 = 28.0;
 pub const HEADER_H_MM: f32 = 6.0;
-const PORT_ROW_MM: f32 = 5.0;
+pub const PORT_ROW_MM: f32 = 5.0;
+/// Height of one param-editor row (drawn below the port rows; see `13-ui-module-api.md`).
+pub const PARAM_ROW_MM: f32 = 6.0;
 /// Padding below the last port row (bottom inner margin).
 const PAD_MM: f32 = 2.5;
 pub const PORT_R_MM: f32 = 1.4;
 
-/// Node box size `[w, h]` in mm for `rows` port rows. The single source of truth for node size,
-/// used by both `node_size` (descriptor-driven) and `geoms`.
-fn size_from_rows(rows: usize) -> [f32; 2] {
+/// Node box size `[w, h]` in mm for `port_rows` port rows plus `param_rows` param-editor rows. The
+/// single source of truth for node size, used by both `node_size` (descriptor-driven) and `geoms`.
+fn node_box(port_rows: usize, param_rows: usize) -> [f32; 2] {
     [
         NODE_W_MM,
-        HEADER_H_MM + rows.max(1) as f32 * PORT_ROW_MM + PAD_MM,
+        HEADER_H_MM + port_rows.max(1) as f32 * PORT_ROW_MM + param_rows as f32 * PARAM_ROW_MM
+            + PAD_MM,
     ]
 }
 
@@ -62,6 +65,18 @@ pub struct NodeGeom {
     pub rect: Rect,
     pub inputs: Vec<PortGeom>,
     pub outputs: Vec<PortGeom>,
+    /// Number of port rows (`max(inputs, outputs)`). Param-editor rows are drawn below these.
+    pub port_rows: usize,
+}
+
+/// A node's resolved presentation from a single `describe` call: port names, editable params, and
+/// whether the type is known. Lets ports/params/sizing share one descriptor computation.
+#[derive(Default)]
+struct NodeDesc {
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+    params: Vec<ParamDesc>,
+    known: bool,
 }
 
 /// A reference to a concrete port on a node, produced by hit-testing.
@@ -109,10 +124,12 @@ impl GraphView {
         }
     }
 
-    /// The port names of a node, as `(inputs, outputs, known)`. Mirrors the engine's resolution:
-    /// `audio_output` is the special sink (`ch0..chN`), everything else comes from the registry
-    /// descriptor; an unknown type has no ports.
-    fn node_ports(&self, node: &Node) -> (Vec<String>, Vec<String>, bool) {
+    /// A node's resolved presentation: input/output port names, editable params, and whether the
+    /// type is known. **One** `describe` call per node — ports, params, and sizing all derive from
+    /// this, so the descriptor (and any cost inside it) is computed once, not per accessor. Mirrors
+    /// the engine's resolution: `audio_output` is the special sink (`ch0..chN`, no params),
+    /// everything else comes from the registry descriptor; an unknown type has nothing.
+    fn node_desc(&self, node: &Node) -> NodeDesc {
         if node.ty == "audio_output" {
             let channels = node
                 .params
@@ -121,14 +138,14 @@ impl GraphView {
                 .unwrap_or(2)
                 .max(1) as usize;
             let inputs = (0..channels).map(|c| format!("ch{c}")).collect();
-            return (inputs, Vec::new(), true);
+            return NodeDesc { inputs, outputs: Vec::new(), params: Vec::new(), known: true };
         }
         let desc = if let Some(src) = self.registry.source(&node.ty) {
             (src.describe)(&node.params)
         } else if let Some(entry) = self.registry.get(&node.ty) {
             (entry.describe)(&node.params)
         } else {
-            return (Vec::new(), Vec::new(), false);
+            return NodeDesc::default();
         };
         let inputs = match desc.inputs {
             Inputs::Fixed(ports) => ports.into_iter().map(|p| p.name).collect(),
@@ -145,16 +162,22 @@ impl GraphView {
                 vec![port.name; connected + 1]
             }
         };
-        let outputs = desc.outputs.iter().map(|p| p.name.clone()).collect();
-        (inputs, outputs, true)
+        let outputs = desc.outputs.into_iter().map(|p| p.name).collect();
+        NodeDesc { inputs, outputs, params: desc.params, known: true }
     }
 
-    /// A node's box size `[w, h]` in mm, derived from its descriptor (port counts). The single
+    /// The editable params a node exposes, as the generic node editor presents them
+    /// (`13-ui-module-api.md`). Empty for the `audio_output` sink and unknown types.
+    pub fn node_params(&self, node: &Node) -> Vec<ParamDesc> {
+        self.node_desc(node).params
+    }
+
+    /// A node's box size `[w, h]` in mm, derived from its descriptor (port + param rows). The single
     /// entry point for node size — shared by rendering, hit-testing, and autolayout. When custom
     /// module UI exists later, this is where a reported size would be substituted.
     pub fn node_size(&self, node: &Node) -> [f32; 2] {
-        let (ins, outs, _) = self.node_ports(node);
-        size_from_rows(ins.len().max(outs.len()))
+        let d = self.node_desc(node);
+        node_box(d.inputs.len().max(d.outputs.len()), d.params.len())
     }
 
     /// Compute geometry for every node from the layout block (center positions). Nodes without a
@@ -162,8 +185,9 @@ impl GraphView {
     pub fn geoms(&self) -> Vec<NodeGeom> {
         let mut out = Vec::with_capacity(self.patch.nodes.len());
         for (i, node) in self.patch.nodes.iter().enumerate() {
-            let (ins, outs, known) = self.node_ports(node);
-            let [w, h] = size_from_rows(ins.len().max(outs.len()));
+            let NodeDesc { inputs: ins, outputs: outs, params, known } = self.node_desc(node);
+            let port_rows = ins.len().max(outs.len());
+            let [w, h] = node_box(port_rows, params.len());
             let center = self.patch.layout.get(&node.id).map(|p| [p[0] as f32, p[1] as f32]).unwrap_or_else(|| {
                 [((i % 5) as f32) * 40.0 - 80.0, ((i / 5) as f32) * 40.0 - 40.0]
             });
@@ -200,6 +224,7 @@ impl GraphView {
                 rect,
                 inputs,
                 outputs,
+                port_rows,
             });
         }
         out
@@ -430,6 +455,7 @@ impl GraphView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use synth_core::module::ParamKind;
 
     fn empty_view() -> GraphView {
         GraphView::new(Patch::from_yaml("version: 1\nnodes: []\nwires: []\n").unwrap())
@@ -544,6 +570,40 @@ mod tests {
         // A fixed input takes one wire: the second connection replaces the first.
         assert_eq!(view.patch.wires.len(), 1);
         assert_eq!(view.patch.wires[0].from.node(), "b");
+    }
+
+    #[test]
+    fn const_exposes_value_param() {
+        let view = GraphView::new(
+            Patch::from_yaml("version: 1\nnodes:\n  - { id: c, type: const_generator }\n").unwrap(),
+        );
+        let params = view.node_params(&view.patch.nodes[0]);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "value");
+        assert!(matches!(params[0].kind, ParamKind::Float { .. }));
+    }
+
+    #[test]
+    fn audio_output_and_unknown_have_no_params() {
+        let view = GraphView::new(
+            Patch::from_yaml(
+                "version: 1\nnodes:\n  - { id: o, type: audio_output }\n  - { id: x, type: nope }\n",
+            )
+            .unwrap(),
+        );
+        assert!(view.node_params(&view.patch.nodes[0]).is_empty());
+        assert!(view.node_params(&view.patch.nodes[1]).is_empty());
+    }
+
+    #[test]
+    fn param_rows_grow_node_height() {
+        let view = GraphView::new(
+            Patch::from_yaml("version: 1\nnodes:\n  - { id: c, type: const_generator }\n").unwrap(),
+        );
+        // const has one output row and one param row, so its box must reserve at least a port row
+        // plus a param row below the header.
+        let h = view.node_size(&view.patch.nodes[0])[1];
+        assert!(h >= HEADER_H_MM + PORT_ROW_MM + PARAM_ROW_MM);
     }
 
     #[test]

@@ -17,8 +17,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use synth_core::model::Patch;
-use synth_core::module::Icon;
+use synth_core::model::{Node, ParamValue, Patch};
+use synth_core::module::{Icon, ParamDesc, ParamKind};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
@@ -28,7 +28,7 @@ use winit::window::{Window, WindowId};
 use crate::audio::Audio;
 use crate::camera::{self, Camera};
 use crate::chrome::{CanvasInput, Chrome, ChromeAction, ChromeInputs};
-use crate::graph::{GraphView, PortRef};
+use crate::graph::{GraphView, PortRef, HEADER_H_MM, PARAM_ROW_MM, PORT_ROW_MM};
 use crate::layout;
 use crate::render::{self, EguiFrame, Renderer, SceneHover, build_scene};
 
@@ -140,6 +140,86 @@ impl App {
             r.set_icons(&self.icon_list);
         }
     }
+
+    /// Draw the generic in-node param editors over the canvas (`13-ui-module-api.md`): one egui
+    /// widget per exposed param, positioned in world space below the node's port rows. Edits
+    /// persist into the patch live; the return value is whether an edit was **committed** this frame
+    /// (so the caller rebuilds the engine once per edit, not every drag frame). `canvas` is the
+    /// canvas region in egui points.
+    fn render_param_editors(&mut self, ctx: &egui::Context, canvas: egui::Rect) -> bool {
+        let pts_per_mm = self.camera.px_per_mm() / ctx.pixels_per_point();
+        // LOD: hide editors when a row would be too small to read/use — they never touch the
+        // high-cardinality path (`12-ui-rendering.md`).
+        if PARAM_ROW_MM * pts_per_mm < 12.0 {
+            return false;
+        }
+        // Editors live on their own egui layer with a world→screen transform, so egui scales and
+        // pans the widgets exactly like the canvas (no per-zoom drift, no pan lag). The layer's
+        // coordinate unit is "points at zoom 1" (world mm × `LOGICAL_PX_PER_MM`) so egui's default
+        // font/padding read correctly at zoom 1; the transform's scaling is then just the zoom.
+        let d = camera::LOGICAL_PX_PER_MM;
+        let scaling = pts_per_mm / d;
+        let pan = self.camera.pan;
+        let center = canvas.center();
+        let transform = egui::emath::TSTransform::new(
+            egui::vec2(center.x - pts_per_mm * pan[0], center.y - pts_per_mm * pan[1]),
+            scaling,
+        );
+        // Clip to the canvas, expressed in the layer's coordinate space (so it maps back to the
+        // canvas rect after the transform — keeps editors from bleeding over the panels).
+        let clip = egui::Rect::from_min_max(
+            transform.inverse().mul_pos(canvas.min),
+            transform.inverse().mul_pos(canvas.max),
+        );
+
+        // Geometry + param descriptors per node, index-aligned with `patch.nodes` (geoms preserves
+        // node order). Computed before the mutable edit loop to avoid aliasing `view`.
+        let geoms = self.view.geoms();
+        let descs: Vec<_> = self
+            .view
+            .patch
+            .nodes
+            .iter()
+            .map(|n| self.view.node_params(n))
+            .collect();
+        let nodes = &mut self.view.patch.nodes;
+
+        // One Area per node, anchored at that node's param strip. egui decides which layer owns a
+        // pointer by an area's *bounding rect*, so each area must be tight to its own widgets — a
+        // single shared area (or one anchored away from its content) blankets the canvas with dead
+        // zones. We anchor at the node's design-space position, lay widgets out locally, and
+        // disable screen-constraining so the layer transform alone places them.
+        let mut committed = false;
+        for (i, g) in geoms.iter().enumerate() {
+            let params = &descs[i];
+            if params.is_empty() {
+                continue;
+            }
+            let node = &mut nodes[i];
+            let top = g.rect.y + HEADER_H_MM + g.port_rows as f32 * PORT_ROW_MM;
+            let row_h = (PARAM_ROW_MM - 1.2) * d;
+            let layer = egui::Area::new(egui::Id::new(("node-params", g.id.as_str())))
+                .order(egui::Order::Middle)
+                .constrain(false)
+                .fixed_pos(egui::pos2((g.rect.x + 1.5) * d, (top + 0.6) * d))
+                .show(ctx, |ui| {
+                    ui.set_clip_rect(clip);
+                    ui.set_max_width((g.rect.w - 3.0) * d);
+                    ui.spacing_mut().item_spacing.y = 1.2 * d;
+                    for pd in params {
+                        if editor_widget(ui, pd, node, row_h) {
+                            committed = true;
+                        }
+                    }
+                })
+                .response
+                .layer_id;
+            ctx.set_transform_layer(layer, transform);
+        }
+        committed
+    }
+
+    // (param editor widget is a free function below)
 
     /// Apply this frame's canvas pointer interaction (from egui) to the camera and graph.
     fn process_canvas_input(&mut self, ci: &CanvasInput, ppp: f32) {
@@ -387,19 +467,43 @@ impl App {
         // Run egui, building the chrome. A cloned context avoids borrowing `self.egui_ctx` while the
         // closure mutably borrows `self.chrome` and reads other disjoint fields.
         let ctx = self.egui_ctx.clone();
-        let inputs = ChromeInputs {
-            registry: &self.view.registry,
-            audio_playing: self.audio.playing,
-            audio_status: &self.audio.status,
-            hover: hover_detail,
-            node_count: self.view.patch.nodes.len(),
-        };
         let mut chrome_out = None;
+        let mut params_committed = false;
         let full_output = ctx.run(raw_input, |ctx| {
-            chrome_out = Some(self.chrome.build(ctx, &inputs));
+            // Build chrome in an inner scope so its borrow of `view`/`audio` ends before the param
+            // editors take a mutable borrow of `view`.
+            let out = {
+                let inputs = ChromeInputs {
+                    registry: &self.view.registry,
+                    audio_playing: self.audio.playing,
+                    audio_status: &self.audio.status,
+                    hover: hover_detail.clone(),
+                    node_count: self.view.patch.nodes.len(),
+                };
+                self.chrome.build(ctx, &inputs)
+            };
+            let ppp = ctx.pixels_per_point();
+            // Central canvas region: egui points → physical px.
+            self.canvas_rect = match out.canvas_rect {
+                Some(r) => [r.min.x * ppp, r.min.y * ppp, r.width() * ppp, r.height() * ppp],
+                None => [0.0, 0.0, 0.0, 0.0],
+            };
+            // Apply this frame's pan/zoom/drag FIRST so the camera is current, then draw the param
+            // editors glued to it — both the editors and the wgpu canvas use the same post-input
+            // camera this frame, so there is no one-frame lag between them.
+            self.process_canvas_input(&out.canvas_input, ppp);
+            if let Some(crect) = out.canvas_rect {
+                params_committed = self.render_param_editors(ctx, crect);
+            }
+            chrome_out = Some(out);
         });
         let chrome_out = chrome_out.expect("chrome built");
-        drop(inputs);
+        // Rebuild only when an edit was committed (drag released / field defocused), so dragging a
+        // value recompiles the engine once on release, not every frame.
+        if params_committed {
+            self.audio
+                .rebuild_if_playing(&self.view.patch, &self.view.registry);
+        }
 
         self.egui_state
             .as_mut()
@@ -413,15 +517,6 @@ impl App {
             .get(&egui::ViewportId::ROOT)
             .map(|v| v.repaint_delay.is_zero())
             .unwrap_or(false);
-
-        // Central canvas region: egui points → physical px.
-        self.canvas_rect = match chrome_out.canvas_rect {
-            Some(r) => [r.min.x * ppp, r.min.y * ppp, r.width() * ppp, r.height() * ppp],
-            None => [0.0, 0.0, 0.0, 0.0],
-        };
-
-        // Canvas pointer interaction, then chrome actions; rebuild the icon atlas if types changed.
-        self.process_canvas_input(&chrome_out.canvas_input, ppp);
 
         let mut needs_atlas = false;
         for action in chrome_out.actions {
@@ -534,5 +629,37 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => self.on_key(event),
             _ => {}
         }
+    }
+}
+
+/// Draw one param's editor (laid out in the current `ui`, sized to the node width × `row_h`),
+/// persisting any change into `node.params` immediately so the value tracks the widget. Returns
+/// whether the edit was **committed** this frame — the signal to rebuild the engine. A drag commits
+/// on release; a typed value commits on Return / losing focus (never per keystroke). Float → a drag
+/// value (click to type a value); other kinds are added in the audio_output slice.
+fn editor_widget(ui: &mut egui::Ui, pd: &ParamDesc, node: &mut Node, row_h: f32) -> bool {
+    match &pd.kind {
+        ParamKind::Float { min, max } => {
+            let mut v = node
+                .params
+                .get(&pd.name)
+                .and_then(|x| x.as_f64())
+                .or_else(|| pd.default.as_f64())
+                .unwrap_or(0.0);
+            let resp = ui.add_sized(
+                [ui.available_width(), row_h],
+                egui::DragValue::new(&mut v)
+                    .speed(0.01)
+                    .range(*min as f64..=*max as f64),
+            );
+            if resp.changed() {
+                node.params.insert(pd.name.clone(), ParamValue::Float(v));
+            }
+            // Two independent commit triggers: a drag commits on release; a typed value commits on
+            // Return / losing focus — never per keystroke.
+            resp.drag_stopped() || resp.lost_focus()
+        }
+        // Int / Bool / Choice editors land with the audio_output dropdowns (next slice).
+        _ => false,
     }
 }
